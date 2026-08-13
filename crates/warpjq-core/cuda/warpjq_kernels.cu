@@ -2,14 +2,25 @@
 //
 // Design notes that are not obvious from the code:
 //
-// * One thread per line, not one warp per line. Log lines are 100-800 bytes,
-//   so a warp-cooperative structural index spends most of its time with 31
-//   lanes idle while lane 0 walks the structural bitmap. Thread-per-line keeps
-//   every lane busy and, more importantly, is a direct transliteration of the
-//   CPU scanner in src/json.rs, which is what lets the differential tests
-//   assert byte equality instead of "close enough". The warp-cooperative
-//   version is a measured optimisation, not a starting point. See
-//   docs/ARCHITECTURE.md.
+// * One thread per line. Each thread runs the whole JSON state machine for
+//   its line, staging the warp's 32 lines through shared memory so the reads
+//   are coalesced. This is not the fastest possible shape and it is not
+//   defended as one; see docs/ARCHITECTURE.md for what has been measured
+//   against it and what a redesign would involve.
+//
+//   Two levers on top of this shape are measured dead. Raising the shared
+//   memory budget from 5120 to 6144 bytes lifts occupancy from 12 to 16 warps
+//   and moves runtime by 0.02%, so it is not occupancy limited. Vectorising
+//   the scan costs 5.2x the instructions for no gain, and the scalar byte
+//   loop already compiles to about 1.5 instructions per byte, so there is no
+//   instruction fat either. What remains is the serial dependency chain
+//   inherent to one thread walking one line, and shortening that means warp
+//   cooperative structural indexing, which is a redesign rather than a tuning
+//   pass.
+//
+//   Note that byte equality with the CPU scanner does not depend on this
+//   shape. The differential tests compare output, not implementation, so any
+//   kernel that produces the same bytes passes them.
 //
 // * The kernel is allowed to give up. Any line it cannot decide *exactly* --
 //   a number outside the provably-correctly-rounded fast path, nesting deeper

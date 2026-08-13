@@ -5,3 +5,6 @@
 /fuzz/artifacts
 *.ndjson
 /modal_results.json
+/modal_ab_results.json
+/modal_h100_repeat.json
+__pycache__/

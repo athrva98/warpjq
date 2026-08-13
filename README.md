@@ -220,13 +220,17 @@ warpjq: invalid query: expected a field path, found `status`
 
 ## How it works
 
-**One thread per line.** Chunks arrive newline-aligned. A CUB stream compaction
-turns newline positions into `(offset, length)` pairs and each thread walks one
-line. A warp per line building a simdjson-style structural bitmap leaves 31
-lanes idle while lane 0 walks the bitmap, which does not pay off at the 100 to
-800 byte lines typical of logs. Thread-per-line is also a direct transliteration
-of the CPU scanner, which is what allows the two engines to be compared byte for
-byte.
+**One thread per line.** Chunks arrive newline-aligned, a scan turns newline
+positions into `(offset, length)` pairs, and each thread runs the whole JSON
+state machine for one line. A warp stages its 32 lines through shared memory
+first, so the span is read with coalesced loads and parsed locally.
+
+This is not the fastest possible shape. Occupancy and instruction count are
+both measured dead ends on top of it, and what remains is the serial dependency
+chain of one thread per line. Shortening that means warp-cooperative structural
+indexing, which is a redesign rather than a tuning pass, and on current numbers
+the host copy is worth more than anything left in the kernels. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 **The query compiles once, on the host.** `select(.a.b == 500) | {x: .c}`
 becomes flat tables: a step list, a comparison table, and the condition in

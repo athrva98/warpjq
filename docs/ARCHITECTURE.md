@@ -85,30 +85,60 @@ upload of chunk *n*. It costs ~0.05 s per GB and is on the roadmap.
 
 ---
 
-## 2. Why one thread per line
+## 2. One thread per line
 
-The plan this project started from specified a warp per line building a
-simdjson-style structural bitmap. The implementation does not do that, on
-purpose.
+Each thread runs the whole JSON state machine for one line. A warp stages its
+32 lines through shared memory first, so the span is pulled with coalesced
+16-byte loads and parsed locally; a warp whose span exceeds the budget parses
+straight from global memory.
 
-Log lines are 100 to 800 bytes. A warp-cooperative structural scan computes the
-quote/escape mask 32 bytes at a time in parallel, and then **serialises** on one
-lane to walk the structural positions and execute the path program. For a
-200-byte line that is ~7 parallel steps followed by ~30 serial ones with 31
-lanes idle. Thread-per-line keeps every lane doing useful work; the reads are
-strided rather than coalesced, but each thread streams sequentially through its
-own line, so the bytes fetched are the bytes needed and the cost is latency,
-which occupancy hides.
+An earlier version of this section defended the shape on two grounds, and both
+were wrong.
 
-The decisive argument is not performance. It is that thread-per-line is a
-direct transliteration of the CPU scanner in `src/json.rs`. Two
-implementations of the same algorithm can be asserted byte-equal. Two different
-algorithms can only be asserted approximately equal, and "approximately equal to
-jq" is not a product.
+**The performance argument was never measured.** It claimed a warp-cooperative
+structural scan would leave 31 lanes idle while lane 0 walked the bitmap, and
+that thread-per-line keeps every lane busy. In fact thread-per-line put every
+lane of a warp in a different 32-byte sector: 26.9 sectors per request against
+a coalesced ideal of 4, with 65% of issue slots stalled on long scoreboard and
+DRAM at 6.7% of peak. Shared-memory staging brought that to 5.29 sectors per
+request and 25% stalls, worth roughly 2x on kernel time. The original claim had
+the direction of the problem backwards.
 
-The warp-cooperative version is on the roadmap for when the input path stops
-being the bottleneck. Currently the kernels are 4x faster than the host can
-feed them, so making them faster would change nothing.
+**The correctness argument confused a property with a mechanism.** It said
+thread-per-line was "a direct transliteration of the CPU scanner, which is what
+lets the differential tests assert byte equality". The tests compare *output*.
+They have no knowledge of how the kernel arrives at it. The proof is that the
+staging and single-pass-extraction rewrite changed the parse substantially and
+224 tests still passed byte-identical on three architectures the kernels had
+never run on. Any kernel producing the same bytes passes the same tests, so the
+suite constrains behaviour, not design.
+
+### What is measured against the current shape
+
+Two levers on top of thread-per-line are dead:
+
+| lever | result |
+|---|---|
+| occupancy | shared budget 5120 to 6144 bytes lifts 12 to 16 warps, runtime moves 0.02% |
+| instruction count | vectorised scan costs 5.2x the instructions for no gain; the scalar loop is already ~1.5 inst/byte |
+
+Neither occupancy nor instruction count is the limit. What remains is the
+serial dependency chain of one thread walking one line, and that is what the
+`wait` stage measures. Shortening it means warp-cooperative structural
+indexing, which is a redesign.
+
+### Whether that redesign is worth doing
+
+Probably not yet, and not for the reason the old text gave. On an H100 at 4 GB,
+`submit` (H2D plus all kernels) is 0.199 s of a 0.751 s run and the host copy
+into pinned memory is 0.200 s, with roughly 0.35 s of fixed CUDA setup and
+process cost on top. Eliminating kernel time entirely buys 26%. Warp
+cooperative indexing would claim some fraction of what is left of `submit`
+after H2D, which is smaller than that.
+
+Reading straight into the pinned staging buffer, and so deleting the copy, is
+worth more than anything left in `k_eval`. It is roadmap item one for that
+reason.
 
 ---
 
