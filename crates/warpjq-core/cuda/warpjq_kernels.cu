@@ -65,7 +65,7 @@
 // Thread-per-line means lane 0 reads byte 0, lane 1 reads byte ~181, lane 2
 // byte ~362: every lane of a warp lands in a different 32-byte sector, so a
 // single load instruction costs 32 sector fetches instead of 4. Measured on
-// the nginx preset that was 183.8M sectors for 6.8M requests -- 26.9 sectors
+// the nginx preset that was 183.8M sectors for 6.8M requests, 26.9 sectors
 // per request, and 65% of the kernel's issue slots stalled on long
 // scoreboard with DRAM at only 6.7% of peak. The kernel was not bandwidth
 // bound, it was thrashing L1 with scattered byte reads.
@@ -841,8 +841,8 @@ __device__ int d_extract_general(const char *line, int n, const DevProgram &p,
 // d_object_get from early-exiting. `select(.status==500) | {p:.path,b:.bytes}`
 // therefore made four full passes.
 //
-// This walk is a superset of what d_validate did to the same bytes -- it
-// skips every member value with d_skip_value_at and checks every separator --
+// This walk is a superset of what d_validate did to the same bytes. It
+// skips every member value with d_skip_value_at and checks every separator,
 // so validating is free, and matching a member key against all the wanted
 // keys at once costs a length compare per key instead of a whole extra pass.
 //
@@ -883,7 +883,7 @@ __device__ int d_extract_object(const char *b, int n, const DevProgram &p,
       if (ve < 0) return ve;
 
       // Hash the member key at most once per member, and only if some wanted
-      // key has the same length -- the length test kills nearly everything.
+      // key has the same length. The length test kills nearly everything.
       unsigned int h = 0;
       bool have_h = false, esc_known = false, esc = false;
 #pragma unroll 1
@@ -1045,8 +1045,8 @@ struct IsNewline {
 // --- newline scan ---------------------------------------------------------
 //
 // This replaced `cub::DeviceSelect::If` over a counting iterator. That works,
-// but cub loads a *blocked* arrangement -- thread t owns items
-// [t*IPT, (t+1)*IPT) -- and the predicate dereferences one byte per item, so
+// but cub loads a *blocked* arrangement, thread t owning items
+// [t*IPT, (t+1)*IPT), and the predicate dereferences one byte per item, so
 // the lanes of a warp read bytes IPT apart. Measured: 31.6M sectors for 2.1M
 // requests, 14.97 per request against a coalesced ideal of 4, and 17% of DRAM
 // peak. The scan is pure streaming work; it should be bandwidth bound.
@@ -1112,8 +1112,8 @@ __device__ __forceinline__ unsigned int d_nl_scan_tile(const char *data,
 
 // Pass 1: newlines per block. Also writes each 16-byte block's mask, so the
 // scatter pass reads 2 bytes per 16 bytes of input instead of re-reading the
-// input itself -- an eighth of the traffic, and the compare work is not
-// repeated either.
+// input itself. That is an eighth of the traffic, and the compare work is
+// not repeated either.
 __global__ __launch_bounds__(WARPJQ_NL_BLOCK) void k_nl_count(
     const char *data, long long n, unsigned int *block_counts,
     unsigned short *masks_out) {
@@ -1160,8 +1160,8 @@ __global__ __launch_bounds__(WARPJQ_NL_BLOCK) void k_nl_write(
     masks[r] = (b < nblk_total) ? (unsigned int)masks_in[b] : 0u;
   }
 
-  // One scan per round, not one for the whole tile. The loads are striped --
-  // in round r, thread t owns the 16 bytes at (r*BLOCK + t)*16 -- so byte
+  // One scan per round, not one for the whole tile. The loads are striped:
+  // in round r, thread t owns the 16 bytes at (r*BLOCK + t)*16, so byte
   // order across the tile is (round, then thread), not (thread, then round).
   // A single scan over each thread's four rounds would emit thread 0's last
   // block before thread 1's first, and nl_pos has to come out ascending
@@ -1407,7 +1407,7 @@ __global__ __launch_bounds__(WARPJQ_EVAL_BLOCK) void k_eval(
   // the chunk size, so that intermediate lands far outside the shared array
   // and only comes back after adding line_off[i]. Shared pointers are a
   // 32-bit window in the generic address space and the compiler is free to
-  // narrow them, so the out-of-window intermediate is undefined -- and it
+  // narrow them, so the out-of-window intermediate is undefined, and it
   // misbehaves exactly when another context shifts where that window sits,
   // which is why it only showed up under concurrent tests.
   const char *line = staged ? (wstage + pre + (line_off[i] - span_start))
@@ -1426,7 +1426,7 @@ __global__ __launch_bounds__(WARPJQ_EVAL_BLOCK) void k_eval(
     }
 
     // The fused walk validates the line as it resolves it, so the separate
-    // d_validate pass -- 37% of this kernel -- only runs for the shapes it
+    // d_validate pass, 37% of this kernel, only runs for the shapes it
     // declines. Where it does run it still runs *first*, so a line that is
     // both malformed and type-erroring is still reported as malformed.
     int fstart = 0;
@@ -1998,7 +1998,7 @@ static warpjq_status alloc_all(warpjq_ctx *ctx, char *err, size_t err_len) {
     // Both the k_eval staging copy and the newline scan issue 16-byte aligned
     // loads that can round past the last line into the pad. The bytes are
     // masked off before use, but reading them at all is reading uninitialised
-    // memory -- compute-sanitizer --tool initcheck says so, and it is right.
+    // memory. compute-sanitizer --tool initcheck says so, and it is right.
     // One memset at setup makes the whole buffer defined for the run.
     // On sl.stream, NOT the default stream: these streams are created
     // cudaStreamNonBlocking, so they do not synchronise with the NULL stream
