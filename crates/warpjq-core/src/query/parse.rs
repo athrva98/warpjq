@@ -69,6 +69,7 @@ pub fn parse(src: &str) -> QueryResult<Program> {
         toks,
         pos: 0,
         paths: Vec::new(),
+        depth: 0,
     };
     p.program()
 }
@@ -124,11 +125,21 @@ fn stage_starts(src: &str) -> Vec<(usize, &str)> {
     out
 }
 
+/// Nesting limit for parenthesised conditions.
+///
+/// `cond -> and_expr -> term -> cond` is recursive, so without a limit a query
+/// of a few hundred open parens overflows the stack and aborts the process.
+/// Anything a person writes is far below this; anything above it is a syntax
+/// error either way, so the limit costs nothing and turns a crash into a
+/// message.
+const MAX_COND_DEPTH: u32 = 64;
+
 struct Parser<'a> {
     src: &'a str,
     toks: Vec<Spanned>,
     pos: usize,
     paths: Vec<Path>,
+    depth: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -453,8 +464,17 @@ impl<'a> Parser<'a> {
         let at = self.at();
 
         let base = if self.eat(&Tok::LParen) {
+            self.depth += 1;
+            if self.depth > MAX_COND_DEPTH {
+                return Err(QueryError::new(
+                    self.src,
+                    at,
+                    format!("conditions may not nest more than {MAX_COND_DEPTH} deep"),
+                ));
+            }
             let c = self.cond()?;
             self.expect(&Tok::RParen, "to close the group")?;
+            self.depth -= 1;
             c
         } else {
             if let Tok::Ident(name) = self.peek().clone() {

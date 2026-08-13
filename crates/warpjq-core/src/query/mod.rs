@@ -373,6 +373,34 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_parens_error_rather_than_overflowing_the_stack() {
+        // cond -> and_expr -> term -> cond is recursive. Without a bound this
+        // aborted the process at roughly 1000 parens, in release, which
+        // `panic = "abort"` makes uncatchable. Found by the query fuzz target
+        // with ~6000 of them.
+        for depth in [100usize, 1_000, 10_000, 100_000] {
+            let q = format!("select({}", "(".repeat(depth));
+            let e = parse(&q).unwrap_err();
+            assert!(
+                e.message.contains("nest more than") || e.message.contains("expected"),
+                "depth {depth} gave: {}",
+                e.message
+            );
+        }
+        // Balanced and deep is rejected on the same bound, not accepted.
+        let q = format!("select({}.a == 1{})", "(".repeat(500), ")".repeat(500));
+        assert!(parse(&q).is_err());
+    }
+
+    #[test]
+    fn nesting_within_the_limit_still_parses() {
+        for depth in [1usize, 8, 32, 64] {
+            let q = format!("select({}.a == 1{})", "(".repeat(depth), ")".repeat(depth));
+            assert!(parse(&q).is_ok(), "depth {depth} should parse");
+        }
+    }
+
+    #[test]
     fn rejects_assignment_with_a_hint() {
         let e = parse("select(.a = 1)").unwrap_err();
         assert!(e.message.contains("did you mean `==`"));

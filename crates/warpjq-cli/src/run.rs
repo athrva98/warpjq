@@ -176,7 +176,7 @@ pub fn generate(args: GenArgs) -> anyhow::Result<ExitCode> {
         }
     };
 
-    if args.output.is_some() {
+    if let Some(path) = args.output.as_ref() {
         let secs = started.elapsed().as_secs_f64();
         eprintln!(
             "warpjq: wrote {} ({} lines) of `{}` data with seed {} in {secs:.1}s",
@@ -185,11 +185,7 @@ pub fn generate(args: GenArgs) -> anyhow::Result<ExitCode> {
             preset.name(),
             args.seed
         );
-        eprintln!(
-            "warpjq: try  warpjq '{}' {}",
-            preset.example_query(),
-            args.output.as_ref().unwrap()
-        );
+        eprintln!("warpjq: try  warpjq '{}' {}", preset.example_query(), path);
     }
     Ok(ExitCode::SUCCESS)
 }
