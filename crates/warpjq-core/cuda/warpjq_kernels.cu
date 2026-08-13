@@ -2385,9 +2385,36 @@ uint64_t warpjq_slot_capacity(const warpjq_ctx *ctx) {
   return ctx ? ctx->chunk_cap : 0;
 }
 
+warpjq_status warpjq_host_register(const void *ptr, uint64_t bytes, char *err,
+                                   size_t err_len) {
+  if (!ptr || bytes == 0) return WARPJQ_ERR_INVALID_ARG;
+  /* ReadOnly skips the write-tracking the driver would otherwise set up, which
+   * is what makes registering a whole multi-gigabyte mapping affordable. The
+   * input is mapped read-only anyway. */
+  CUDA_TRY(cudaHostRegister(const_cast<void *>(ptr), (size_t)bytes,
+                            cudaHostRegisterReadOnly),
+           "cudaHostRegister(input)");
+  return WARPJQ_OK;
+}
+
+void warpjq_host_unregister(const void *ptr) {
+  if (!ptr) return;
+  /* Nothing useful to do on failure: the process is tearing down the mapping
+   * either way, and reporting it would only mask the error that got us here. */
+  cudaHostUnregister(const_cast<void *>(ptr));
+}
+
 warpjq_status warpjq_submit(warpjq_ctx *ctx, uint32_t slot, uint64_t n_bytes,
                             char *err, size_t err_len) {
   if (!ctx || slot >= ctx->n_slots) return WARPJQ_ERR_INVALID_ARG;
+  return warpjq_submit_from(ctx, slot, ctx->slots[slot].h_pinned, n_bytes, err,
+                            err_len);
+}
+
+warpjq_status warpjq_submit_from(warpjq_ctx *ctx, uint32_t slot,
+                                 const uint8_t *src, uint64_t n_bytes,
+                                 char *err, size_t err_len) {
+  if (!ctx || slot >= ctx->n_slots || !src) return WARPJQ_ERR_INVALID_ARG;
   if (n_bytes > ctx->chunk_cap) return WARPJQ_ERR_INVALID_ARG;
   Slot &sl = ctx->slots[slot];
   sl.n_bytes = (long long)n_bytes;
@@ -2401,8 +2428,7 @@ warpjq_status warpjq_submit(warpjq_ctx *ctx, uint32_t slot, uint64_t n_bytes,
     return WARPJQ_OK;
   }
 
-  CUDA_TRY(cudaMemcpyAsync(sl.d_data, sl.h_pinned, n_bytes,
-                           cudaMemcpyHostToDevice, st),
+  CUDA_TRY(cudaMemcpyAsync(sl.d_data, src, n_bytes, cudaMemcpyHostToDevice, st),
            "H2D chunk");
   CUDA_TRY(cudaMemsetAsync(sl.d_ctr, 0, sizeof(ChunkCounters), st),
            "memset(ctr)");

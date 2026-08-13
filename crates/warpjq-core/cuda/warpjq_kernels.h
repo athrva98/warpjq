@@ -256,6 +256,34 @@ uint64_t warpjq_slot_capacity(const warpjq_ctx *ctx);
 warpjq_status warpjq_submit(warpjq_ctx *ctx, uint32_t slot, uint64_t n_bytes,
                             char *err, size_t err_len);
 
+/* Pins an arbitrary host range so the DMA engine can read it directly.
+ *
+ * This is what removes the staging copy. Without it every chunk is memcpy'd
+ * from the mapped file into the pinned slot buffer before the H2D, and that
+ * copy was measured at 73% of an 8 GB run: more than the transfer and the
+ * kernels put together. Registering the mapping once makes the file itself
+ * the DMA source and the copy disappears.
+ *
+ * The range must be page-aligned at the base; an mmap already is. Length is
+ * rounded up to a page by the driver, which stays inside the mapping because
+ * mmap hands out whole pages.
+ *
+ * Registration is not free (the driver walks and pins every page) and it can
+ * fail on a range this large, so the caller must be able to fall back to the
+ * staging path rather than treating failure as fatal. */
+warpjq_status warpjq_host_register(const void *ptr, uint64_t bytes, char *err,
+                                   size_t err_len);
+void warpjq_host_unregister(const void *ptr);
+
+/* Same as warpjq_submit, but DMAs from `src` instead of the slot's staging
+ * buffer. `src` must stay untouched until warpjq_wait returns for this slot,
+ * and must be either registered by warpjq_host_register or accepted as
+ * pageable memory, in which case the driver reintroduces the copy internally
+ * and the whole exercise is pointless. */
+warpjq_status warpjq_submit_from(warpjq_ctx *ctx, uint32_t slot,
+                                 const uint8_t *src, uint64_t n_bytes,
+                                 char *err, size_t err_len);
+
 /* Blocks until `slot` is done and fills `out`. Pointers in `out` remain valid
  * until the next submit on the same slot. */
 warpjq_status warpjq_wait(warpjq_ctx *ctx, uint32_t slot,

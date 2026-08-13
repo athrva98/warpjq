@@ -173,6 +173,23 @@ extern "C" {
         err_len: usize,
     ) -> i32;
 
+    pub fn warpjq_host_register(
+        ptr: *const u8,
+        bytes: u64,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> i32;
+    pub fn warpjq_host_unregister(ptr: *const u8);
+
+    pub fn warpjq_submit_from(
+        ctx: *mut Ctx,
+        slot: u32,
+        src: *const u8,
+        n_bytes: u64,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> i32;
+
     pub fn warpjq_wait(
         ctx: *mut Ctx,
         slot: u32,
