@@ -560,6 +560,19 @@ fn drain_slot<W: Write>(
         &[]
     };
 
+    // With nothing to interleave, the device's block is already exactly the
+    // bytes to emit, in order. Walking it row by row would copy every byte
+    // again to arrive at what it already is. This is the usual case: the
+    // kernel decides nearly every line, and fallback is the exception.
+    if n_fb == 0 {
+        if n_sel > 0 {
+            let s = row_off[0] as usize;
+            let e = row_off[n_sel] as usize;
+            writer.write_bulk(&out_bytes[s..e], n_sel as u64)?;
+        }
+        return Ok(());
+    }
+
     let mut gi = 0usize;
     let mut fi = 0usize;
     while gi < n_sel || fi < n_fb {
