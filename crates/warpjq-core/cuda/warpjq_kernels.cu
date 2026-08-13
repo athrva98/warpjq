@@ -1145,9 +1145,20 @@ __global__ void k_nl_total(const unsigned int *block_base, unsigned int nblocks,
 // Pass 2: write the positions. `block_base` is the exclusive prefix sum of
 // pass 1, so every block knows exactly where its run of positions starts and
 // the output stays in ascending order without any atomics.
+//
+// `nl_cap` is the length of nl_pos, and it is not a formality. The buffer is
+// sized at chunk_cap/WARPJQ_MIN_LINE_BYTES, which assumes no line is shorter
+// than 24 bytes; `{"a":1}` is seven. The caller does check whether the chunk
+// held more lines than the buffers allow, but it can only do so after this
+// kernel has run, so without a bound here that check reports a condition this
+// kernel has already corrupted memory to produce. Clamping costs one
+// comparison per newline and turns silent corruption into the CPU fallback
+// the caller already implements. The true count comes from k_nl_total, which
+// reads the scan rather than this buffer, so clamping loses nothing the
+// caller needs to detect the overflow.
 __global__ __launch_bounds__(WARPJQ_NL_BLOCK) void k_nl_write(
     long long n, const unsigned int *block_base,
-    const unsigned short *masks_in, int *nl_pos) {
+    const unsigned short *masks_in, int *nl_pos, long long nl_cap) {
   typedef cub::BlockScan<unsigned int, WARPJQ_NL_BLOCK> BS;
   __shared__ typename BS::TempStorage tmp;
   unsigned int masks[WARPJQ_NL_PER_THREAD];
@@ -1179,7 +1190,8 @@ __global__ __launch_bounds__(WARPJQ_NL_BLOCK) void k_nl_write(
     while (m) {
       int b = __ffs(m) - 1;
       m &= m - 1;
-      nl_pos[w++] = (int)(off + b);
+      if (w < nl_cap) nl_pos[w] = (int)(off + b);
+      w++;
     }
     base += round_total;
     __syncthreads();  // TempStorage is reused by the next round
@@ -2430,7 +2442,8 @@ warpjq_status warpjq_submit(warpjq_ctx *ctx, uint32_t slot, uint64_t n_bytes,
                                          st),
            "cub::DeviceScan(newlines)");
   k_nl_write<<<(unsigned)nl_blocks, WARPJQ_NL_BLOCK, 0, st>>>(
-      (long long)n_bytes, sl.d_nl_base, sl.d_nl_masks, sl.d_nl_pos);
+      (long long)n_bytes, sl.d_nl_base, sl.d_nl_masks, sl.d_nl_pos,
+      ctx->max_lines);
   k_nl_total<<<1, 1, 0, st>>>(sl.d_nl_base, (unsigned int)nl_blocks,
                               sl.d_n_nl);
 
