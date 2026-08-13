@@ -507,10 +507,23 @@ fn drain_slot<W: Write>(
         &[]
     };
 
+    // The kernel appends fallback entries with an atomicAdd, so the three
+    // arrays come back in whatever order the blocks happened to retire --
+    // *not* in line order. Both the CPU re-evaluation below and the
+    // two-pointer merge further down require ascending line indices, so sort
+    // an index permutation first. This is cheap: falling back is rare by
+    // design, and n_fb is a small fraction of the chunk.
+    //
+    // Getting this wrong emits real lines in the wrong positions rather than
+    // producing garbage, which is exactly the kind of bug that hides until
+    // some unrelated change perturbs the scheduling.
+    let mut order: Vec<usize> = (0..n_fb).collect();
+    order.sort_unstable_by_key(|&k| fb_idx[k]);
+
     let mut fb_totals = Totals::for_program(program);
     let (fb_rows, fb_bad, fb_type) = crate::exec::cpu::eval_lines_for_fallback(
         plan,
-        (0..n_fb).map(|k| {
+        order.iter().map(|&k| {
             let s = fb_off[k] as usize;
             &data[s..s + fb_len[k] as usize]
         }),
@@ -555,7 +568,8 @@ fn drain_slot<W: Write>(
         } else if fi >= n_fb {
             true
         } else {
-            sel_idx[gi] < fb_idx[fi]
+            // fb_rows is in `order` sequence, so compare against the same.
+            sel_idx[gi] < fb_idx[order[fi]]
         };
         if take_gpu {
             let s = row_off[gi] as usize;

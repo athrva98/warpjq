@@ -1,4 +1,4 @@
-// warpjq CUDA kernels.
+﻿// warpjq CUDA kernels.
 //
 // Design notes that are not obvious from the code:
 //
@@ -48,6 +48,34 @@
 #define WARPJQ_GROUP_MAX_PROBE 64
 #define WARPJQ_GROUP_KEY_MAX 65535
 #define WARPJQ_BLOCK 256
+
+// --- k_eval line staging ------------------------------------------------
+//
+// Thread-per-line means lane 0 reads byte 0, lane 1 reads byte ~181, lane 2
+// byte ~362: every lane of a warp lands in a different 32-byte sector, so a
+// single load instruction costs 32 sector fetches instead of 4. Measured on
+// the nginx preset that was 183.8M sectors for 6.8M requests -- 26.9 sectors
+// per request, and 65% of the kernel's issue slots stalled on long
+// scoreboard with DRAM at only 6.7% of peak. The kernel was not bandwidth
+// bound, it was thrashing L1 with scattered byte reads.
+//
+// The 32 lines a warp owns are *contiguous* in the input, so the warp can
+// pull that whole span cooperatively with fully-coalesced 16-byte loads and
+// then parse out of shared memory. Global traffic becomes sequential, and
+// the two-plus passes the parser makes over each line get served by shared
+// memory at no sector cost at all.
+//
+// A warp whose span does not fit the budget parses straight from global
+// memory exactly as before, so behaviour is identical either way.
+#define WARPJQ_EVAL_BLOCK 128
+#define WARPJQ_EVAL_WARPS (WARPJQ_EVAL_BLOCK / 32)
+// 32 lines * 256 bytes. Covers every line of the nginx preset (max 216) and
+// anything else with sane record sizes.
+#define WARPJQ_WARP_STAGE 8192
+// Slack for the aligned copy: up to 15 bytes of lead-in from rounding the
+// source down to a 16-byte boundary, plus up to 15 of round-up at the tail.
+#define WARPJQ_STAGE_SLACK 32
+#define WARPJQ_DATA_PAD 32
 
 #define WARPJQ_EMPTY_SLOT 0xFFFFFFFFFFFFFFFFull
 
@@ -173,9 +201,13 @@ __device__ __forceinline__ int d_expect_lit(const char *b, int i, int n,
 
 // Iterative whole-value skip. Recursion would blow the per-thread stack on
 // deeply nested input and, worse, do so nondeterministically.
-__device__ int d_skip_value(const char *b, int i, int n) {
+// `depth0` is the container depth this value already sits inside. The fused
+// object scan walks the top-level braces itself and skips member values with
+// depth0 = 1, so the WARPJQ_MAX_DEPTH cutoff falls on exactly the same inputs
+// as when d_validate walked the whole line from depth 0.
+__device__ int d_skip_value_at(const char *b, int i, int n, int depth0) {
   unsigned long long is_arr = 0;  // bit d set => container at depth d is an array
-  int depth = 0;
+  int depth = depth0;
   enum { WANT_VALUE, WANT_KEY, AFTER_VALUE };
   int state = WANT_VALUE;
 
@@ -239,7 +271,7 @@ __device__ int d_skip_value(const char *b, int i, int n) {
       i++;
       state = WANT_VALUE;
     } else {  // AFTER_VALUE
-      if (depth == 0) return i;
+      if (depth == depth0) return i;
       i = d_skip_ws(b, i, n);
       if (i >= n) return R_INVALID;
       char c = b[i];
@@ -258,6 +290,10 @@ __device__ int d_skip_value(const char *b, int i, int n) {
       }
     }
   }
+}
+
+__device__ __forceinline__ int d_skip_value(const char *b, int i, int n) {
+  return d_skip_value_at(b, i, n, 0);
 }
 
 // Whole-line validation: exactly one value, then only whitespace.
@@ -602,6 +638,10 @@ __device__ int d_array_get(const char *b, int i, int n, unsigned int idx,
   }
 }
 
+__device__ int d_walk_steps(const char *line, int n, const warpjq_step *steps,
+                            int nsteps, int s0, const unsigned char *blob,
+                            int start, int end, int kind, DevSlot *out);
+
 // 0 on success, or one of R_INVALID / R_FALLBACK / R_TYPE_ERROR.
 __device__ int d_lookup(const char *line, int n, const warpjq_step *steps,
                         int nsteps, const unsigned char *blob, DevSlot *out) {
@@ -619,7 +659,15 @@ __device__ int d_lookup(const char *line, int n, const warpjq_step *steps,
     return 0;
   }
 
-  for (int s = 0; s < nsteps; s++) {
+  return d_walk_steps(line, n, steps, nsteps, 0, blob, start, end, kind, out);
+}
+
+// The step loop, split out of d_lookup so the fused object scan can hand it a
+// span it already resolved and have it continue from step `s0`.
+__device__ int d_walk_steps(const char *line, int n, const warpjq_step *steps,
+                            int nsteps, int s0, const unsigned char *blob,
+                            int start, int end, int kind, DevSlot *out) {
+  for (int s = s0; s < nsteps; s++) {
     if (kind == JK_MISSING || kind == JK_NULL) {
       out->off = -1;
       out->len = 0;
@@ -753,8 +801,15 @@ struct DevProgram {
 };
 
 // Resolves every path the query needs into `slots`, indexed by slot number.
-__device__ int d_extract(const char *line, int n, const DevProgram &p,
-                         DevSlot *slots) {
+//
+// `top_end` reports where the top-level value ended when this call validated
+// it in full, or -1 when it did not. See the comment on d_extract_object.
+//
+// The general path below is the original one: one d_lookup per needed path,
+// each re-walking the line from the start. k_eval must run d_validate itself
+// in that case.
+__device__ int d_extract_general(const char *line, int n, const DevProgram &p,
+                                 DevSlot *slots) {
   for (unsigned int k = 0; k < p.n_needed; k++) {
     unsigned int pid = p.needed_paths[k];
     warpjq_path pp = p.paths[pid];
@@ -765,6 +820,162 @@ __device__ int d_extract(const char *line, int n, const DevProgram &p,
     slots[p.slot_of_path[pid]] = s;
   }
   return 0;
+}
+
+// One validating walk of a top-level object that resolves every path at once.
+//
+// The shape this replaces read each line at least twice and often four times:
+// d_validate walked the whole line through the state machine, then d_extract
+// walked it again once *per needed path*, because last-duplicate-wins stops
+// d_object_get from early-exiting. `select(.status==500) | {p:.path,b:.bytes}`
+// therefore made four full passes.
+//
+// This walk is a superset of what d_validate did to the same bytes -- it
+// skips every member value with d_skip_value_at and checks every separator --
+// so validating is free, and matching a member key against all the wanted
+// keys at once costs a length compare per key instead of a whole extra pass.
+//
+// Only taken when the top-level value is an object and no needed path starts
+// with an array index. Everything else uses d_extract_general, unchanged.
+__device__ int d_extract_object(const char *b, int n, const DevProgram &p,
+                                DevSlot *slots, int start) {
+  int found_s[WARPJQ_MAX_SLOTS], found_e[WARPJQ_MAX_SLOTS];
+#pragma unroll 1
+  for (unsigned int k = 0; k < p.n_needed; k++) found_s[k] = -1;
+
+  // A key whose escapes will not decode means this line has to go to the CPU,
+  // but it must not *preempt* a malformed-line verdict: d_validate used to
+  // walk the entire line before extraction ever ran, so a line that is both
+  // undecodable and malformed counted as invalid, not as a fallback. Record
+  // it and keep walking; the structural checks below still get to fire first.
+  bool defer_fallback = false;
+
+  int j = d_skip_ws(b, start + 1, n);
+  if (j < n && b[j] == '}') {
+    j++;
+  } else {
+    for (;;) {
+      j = d_skip_ws(b, j, n);
+      if (j >= n || b[j] != '"') return R_INVALID;
+      int key_start = j;
+      j = d_skip_string(b, j, n);
+      if (j < 0) return j;
+      const char *kbody = b + key_start + 1;
+      int klen = j - key_start - 2;
+
+      j = d_skip_ws(b, j, n);
+      if (j >= n || b[j] != ':') return R_INVALID;
+      int vs = d_skip_ws(b, j + 1, n);
+      // depth0 = 1: this value sits inside the object we are walking, which
+      // is the depth d_validate would have counted it at.
+      int ve = d_skip_value_at(b, vs, n, 1);
+      if (ve < 0) return ve;
+
+      // Hash the member key at most once per member, and only if some wanted
+      // key has the same length -- the length test kills nearly everything.
+      unsigned int h = 0;
+      bool have_h = false, esc_known = false, esc = false;
+#pragma unroll 1
+      for (unsigned int k = 0; k < p.n_needed && !defer_fallback; k++) {
+        warpjq_path pp = p.paths[p.needed_paths[k]];
+        if (pp.step_count == 0) continue;  // identity, resolved from the span
+        const warpjq_step st = p.steps[pp.step_off];
+        const unsigned char *want = p.blob + st.key_off;
+        int wlen = (int)st.key_len;
+        bool bad = false;
+        if (klen == wlen) {
+          if (!have_h) {
+            h = d_str_hash(kbody, klen, &bad);
+            if (bad) { defer_fallback = true; break; }
+            have_h = true;
+          }
+          if (h == st.key_hash && d_key_eq(kbody, klen, want, wlen, &bad)) {
+            found_s[k] = vs;
+            found_e[k] = ve;
+          }
+          if (bad) { defer_fallback = true; break; }
+        } else {
+          // Escaped keys can decode to a different length, so the cheap
+          // length test is only conclusive when there are no escapes.
+          if (!esc_known) {
+            esc = false;
+            for (int q = 0; q < klen; q++)
+              if (kbody[q] == '\\') { esc = true; break; }
+            esc_known = true;
+          }
+          if (esc) {
+            if (d_key_eq(kbody, klen, want, wlen, &bad)) {
+              found_s[k] = vs;
+              found_e[k] = ve;
+            }
+            if (bad) { defer_fallback = true; break; }
+          }
+        }
+      }
+
+      j = d_skip_ws(b, ve, n);
+      if (j >= n) return R_INVALID;
+      if (b[j] == ',') { j++; continue; }
+      if (b[j] == '}') { j++; break; }
+      return R_INVALID;
+    }
+  }
+
+  // The object is structurally sound. Check the tail *before* resolving any
+  // path, so "malformed line" still beats "type error" the way
+  // d_validate-then-extract ordered them.
+  const int obj_end = j;
+  if (d_skip_ws(b, obj_end, n) != n) return R_INVALID;
+  if (defer_fallback) return R_FALLBACK;
+
+#pragma unroll 1
+  for (unsigned int k = 0; k < p.n_needed; k++) {
+    unsigned int pid = p.needed_paths[k];
+    warpjq_path pp = p.paths[pid];
+    DevSlot s;
+    if (pp.step_count == 0) {
+      s.off = start;
+      s.len = obj_end - start;
+      s.kind = JK_OBJ;
+    } else if (found_s[k] < 0) {
+      s.off = -1;
+      s.len = 0;
+      s.kind = JK_MISSING;
+    } else {
+      int vs = found_s[k], ve = found_e[k];
+      int kind = d_kind_of(b[vs]);
+      if (pp.step_count == 1) {
+        s.off = vs;
+        s.len = ve - vs;
+        s.kind = kind;
+      } else {
+        int r = d_walk_steps(b, n, p.steps + pp.step_off, (int)pp.step_count, 1,
+                             p.blob, vs, ve, kind, &s);
+        if (r < 0) return r;
+      }
+    }
+    slots[p.slot_of_path[pid]] = s;
+  }
+  return 0;
+}
+
+// True when the fused single-walk extraction applies to this line: a
+// top-level object, at least one needed path, and no path starting with an
+// array index (that would be a type error the general path already words
+// correctly). Cheap enough to test per line; the loop is over n_needed, which
+// is at most WARPJQ_MAX_SLOTS and normally one or two.
+__device__ __forceinline__ bool d_fusable(const char *line, int n,
+                                          const DevProgram &p, int *start) {
+  if (p.n_needed == 0) return false;
+  int s = d_skip_ws(line, 0, n);
+  if (s >= n || d_kind_of(line[s]) != JK_OBJ) return false;
+  for (unsigned int k = 0; k < p.n_needed; k++) {
+    warpjq_path pp = p.paths[p.needed_paths[k]];
+    if (pp.step_count != 0 && p.steps[pp.step_off].kind != WARPJQ_STEP_KEY)
+      return false;
+  }
+  *start = s;
+  return true;
 }
 
 __device__ int d_eval_cond(const char *line, const DevProgram &p,
@@ -819,6 +1030,150 @@ struct IsNewline {
     return data[i] == '\n';
   }
 };
+
+// --- newline scan ---------------------------------------------------------
+//
+// This replaced `cub::DeviceSelect::If` over a counting iterator. That works,
+// but cub loads a *blocked* arrangement -- thread t owns items
+// [t*IPT, (t+1)*IPT) -- and the predicate dereferences one byte per item, so
+// the lanes of a warp read bytes IPT apart. Measured: 31.6M sectors for 2.1M
+// requests, 14.97 per request against a coalesced ideal of 4, and 17% of DRAM
+// peak. The scan is pure streaming work; it should be bandwidth bound.
+//
+// Instead each thread takes one 16-byte block, so a warp reads 512 contiguous
+// bytes per instruction. Two passes (count, then scatter) cost a second read
+// of the input but each runs coalesced, which is the cheaper trade.
+//
+// Output must stay in ascending position order: k_build_lines pairs
+// nl_pos[i-1] with nl_pos[i], so a warp-aggregated-atomics single pass, which
+// would be faster still, is not usable here.
+#define WARPJQ_NL_BLOCK 256
+#define WARPJQ_NL_PER_THREAD 4          // 16-byte blocks per thread
+#define WARPJQ_NL_TILE (WARPJQ_NL_BLOCK * WARPJQ_NL_PER_THREAD * 16)
+
+// Newline bitmask of the 16 bytes at `v`, bit k set when byte k is '\n'.
+//
+// __vseteq4 is a per-byte SIMD compare returning 0x01 in each matching byte.
+// The tempting SWAR alternative, `(x - 0x01010101) & ~x & 0x80808080`, is a
+// *has-any-zero-byte* test, not a per-byte one: the subtraction borrows
+// across byte lanes, so the bit positions it reports are wrong whenever a
+// zero byte sits next to a small one. It finds newlines in most data and
+// misplaces them in some, which is the worst kind of wrong.
+__device__ __forceinline__ unsigned int d_nl_mask16(const uint4 &v) {
+  unsigned int m = 0;
+  const unsigned int w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    unsigned int eq = __vseteq4(w[i], 0x0A0A0A0Au);
+    m |= ((eq >> 0) & 1u) << (i * 4 + 0);
+    m |= ((eq >> 8) & 1u) << (i * 4 + 1);
+    m |= ((eq >> 16) & 1u) << (i * 4 + 2);
+    m |= ((eq >> 24) & 1u) << (i * 4 + 3);
+  }
+  return m;
+}
+
+// Per-thread newline count for its slice of the tile. `n` is the chunk length;
+// blocks past the end contribute nothing.
+__device__ __forceinline__ unsigned int d_nl_scan_tile(const char *data,
+                                                       long long n,
+                                                       long long tile_start,
+                                                       int tid,
+                                                       unsigned int masks[]) {
+  unsigned int total = 0;
+#pragma unroll
+  for (int r = 0; r < WARPJQ_NL_PER_THREAD; r++) {
+    // Consecutive lanes take consecutive 16-byte blocks within each round.
+    const long long off =
+        tile_start + (long long)(r * WARPJQ_NL_BLOCK + tid) * 16;
+    unsigned int m = 0;
+    if (off < n) {
+      uint4 v = *(const uint4 *)(data + off);
+      m = d_nl_mask16(v);
+      const long long left = n - off;
+      if (left < 16) m &= (1u << (unsigned)left) - 1u;  // clip the tail
+    }
+    masks[r] = m;
+    total += __popc(m);
+  }
+  return total;
+}
+
+// Pass 1: newlines per block. Also writes each 16-byte block's mask, so the
+// scatter pass reads 2 bytes per 16 bytes of input instead of re-reading the
+// input itself -- an eighth of the traffic, and the compare work is not
+// repeated either.
+__global__ __launch_bounds__(WARPJQ_NL_BLOCK) void k_nl_count(
+    const char *data, long long n, unsigned int *block_counts,
+    unsigned short *masks_out) {
+  typedef cub::BlockReduce<unsigned int, WARPJQ_NL_BLOCK> BR;
+  __shared__ typename BR::TempStorage tmp;
+  unsigned int masks[WARPJQ_NL_PER_THREAD];
+  const long long tile_start = (long long)blockIdx.x * WARPJQ_NL_TILE;
+  unsigned int mine = d_nl_scan_tile(data, n, tile_start, threadIdx.x, masks);
+
+  const long long blk0 = tile_start >> 4;  // index of this tile's first block
+#pragma unroll
+  for (int r = 0; r < WARPJQ_NL_PER_THREAD; r++) {
+    // Same striped mapping as the loads, so these stores are coalesced too.
+    masks_out[blk0 + r * WARPJQ_NL_BLOCK + threadIdx.x] =
+        (unsigned short)masks[r];
+  }
+
+  unsigned int total = BR(tmp).Sum(mine);
+  if (threadIdx.x == 0) block_counts[blockIdx.x] = total;
+}
+
+// The scan's last element is the total; hand it to the host in the width the
+// rest of the pipeline expects.
+__global__ void k_nl_total(const unsigned int *block_base, unsigned int nblocks,
+                           long long *out) {
+  *out = (long long)block_base[nblocks];
+}
+
+// Pass 2: write the positions. `block_base` is the exclusive prefix sum of
+// pass 1, so every block knows exactly where its run of positions starts and
+// the output stays in ascending order without any atomics.
+__global__ __launch_bounds__(WARPJQ_NL_BLOCK) void k_nl_write(
+    long long n, const unsigned int *block_base,
+    const unsigned short *masks_in, int *nl_pos) {
+  typedef cub::BlockScan<unsigned int, WARPJQ_NL_BLOCK> BS;
+  __shared__ typename BS::TempStorage tmp;
+  unsigned int masks[WARPJQ_NL_PER_THREAD];
+  const long long tile_start = (long long)blockIdx.x * WARPJQ_NL_TILE;
+  const long long blk0 = tile_start >> 4;
+  const long long nblk_total = (n + 15) >> 4;
+#pragma unroll
+  for (int r = 0; r < WARPJQ_NL_PER_THREAD; r++) {
+    const long long b = blk0 + r * WARPJQ_NL_BLOCK + threadIdx.x;
+    masks[r] = (b < nblk_total) ? (unsigned int)masks_in[b] : 0u;
+  }
+
+  // One scan per round, not one for the whole tile. The loads are striped --
+  // in round r, thread t owns the 16 bytes at (r*BLOCK + t)*16 -- so byte
+  // order across the tile is (round, then thread), not (thread, then round).
+  // A single scan over each thread's four rounds would emit thread 0's last
+  // block before thread 1's first, and nl_pos has to come out ascending
+  // because k_build_lines pairs nl_pos[i-1] with nl_pos[i]. Scanning per
+  // round keeps the striped loads coalesced *and* the output ordered.
+  unsigned int base = block_base[blockIdx.x];
+#pragma unroll
+  for (int r = 0; r < WARPJQ_NL_PER_THREAD; r++) {
+    unsigned int m = masks[r];
+    unsigned int offset = 0, round_total = 0;
+    BS(tmp).ExclusiveSum(__popc(m), offset, round_total);
+    unsigned int w = base + offset;
+    const long long off =
+        tile_start + (long long)(r * WARPJQ_NL_BLOCK + threadIdx.x) * 16;
+    while (m) {
+      int b = __ffs(m) - 1;
+      m &= m - 1;
+      nl_pos[w++] = (int)(off + b);
+    }
+    base += round_total;
+    __syncthreads();  // TempStorage is reused by the next round
+  }
+}
 
 // Turns newline positions into (offset, length) pairs, trimming a trailing
 // '\r' so CRLF input behaves, and flagging blank lines so they neither produce
@@ -986,14 +1341,49 @@ struct ChunkCounters {
   unsigned int saw_non_numeric;
 };
 
-__global__ void k_eval(const char *data, const unsigned int *line_off,
-                       const unsigned int *line_len, long long n_lines,
-                       DevProgram p, unsigned char *status, unsigned char *pass,
-                       double *agg_value, unsigned int *group_slot,
-                       GroupTable table, ChunkCounters *ctr,
-                       unsigned int *fallback_idx, unsigned int *fallback_off,
-                       unsigned int *fallback_len, unsigned int fallback_cap) {
-  long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+__global__ __launch_bounds__(WARPJQ_EVAL_BLOCK) void k_eval(
+    const char *data, const unsigned int *line_off,
+    const unsigned int *line_len, long long n_lines, DevProgram p,
+    unsigned char *status, unsigned char *pass, double *agg_value,
+    unsigned int *group_slot, GroupTable table, ChunkCounters *ctr,
+    unsigned int *fallback_idx, unsigned int *fallback_off,
+    unsigned int *fallback_len, unsigned int fallback_cap) {
+  // See the WARPJQ_WARP_STAGE notes: the warp stages its 32 lines' contiguous
+  // span into shared memory with coalesced loads, then everyone parses local.
+  __shared__ __align__(16) char stage[WARPJQ_EVAL_WARPS *
+                                      (WARPJQ_WARP_STAGE + WARPJQ_STAGE_SLACK)];
+
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  char *wstage = stage + warp * (WARPJQ_WARP_STAGE + WARPJQ_STAGE_SLACK);
+
+  const long long wbase =
+      blockIdx.x * (long long)WARPJQ_EVAL_BLOCK + (long long)(warp << 5);
+  const long long i = wbase + lane;
+
+  // Stage decision is warp-uniform: every lane computes it from the same
+  // first/last line of the warp, so there is no divergence and no ballot.
+  bool staged = false;
+  unsigned int span_start = 0;
+  int pre = 0;
+  if (wbase < n_lines) {
+    const long long wlast = min(wbase + 31, n_lines - 1);
+    span_start = line_off[wbase];
+    const unsigned int span_end = line_off[wlast] + line_len[wlast];
+    const unsigned int span = span_end - span_start;
+    pre = (int)(((uintptr_t)(data + span_start)) & 15);
+    const int nblk = (int)((unsigned)(pre + span + 15) >> 4);
+    if ((unsigned)(nblk << 4) <= WARPJQ_WARP_STAGE + WARPJQ_STAGE_SLACK) {
+      const uint4 *src = (const uint4 *)((data + span_start) - pre);
+      uint4 *dst = (uint4 *)wstage;
+      // Consecutive lanes read consecutive 16-byte blocks: one 512-byte
+      // coalesced request per step instead of 32 scattered sectors.
+      for (int b = lane; b < nblk; b += 32) dst[b] = src[b];
+      staged = true;
+    }
+    __syncwarp();
+  }
+
   if (i >= n_lines) return;
   if (status[i] == WARPJQ_LINE_BLANK) {
     pass[i] = 0;
@@ -1001,19 +1391,20 @@ __global__ void k_eval(const char *data, const unsigned int *line_off,
     return;
   }
 
-  const char *line = data + line_off[i];
+  // Rebase inside the staged span. Note this must not be written as a
+  // precomputed `wstage + pre - span_start` base pointer: span_start reaches
+  // the chunk size, so that intermediate lands far outside the shared array
+  // and only comes back after adding line_off[i]. Shared pointers are a
+  // 32-bit window in the generic address space and the compiler is free to
+  // narrow them, so the out-of-window intermediate is undefined -- and it
+  // misbehaves exactly when another context shifts where that window sits,
+  // which is why it only showed up under concurrent tests.
+  const char *line = staged ? (wstage + pre + (line_off[i] - span_start))
+                            : (data + line_off[i]);
   int n = (int)line_len[i];
   pass[i] = 0;
 
-  int rc = d_validate(line, n);
-  if (rc == R_INVALID) {
-    status[i] = WARPJQ_LINE_INVALID;
-    atomicAdd(&ctr->n_invalid, 1ull);
-    atomicMin(&ctr->first_invalid, (unsigned int)i);
-    return;
-  }
-  if (rc == R_FALLBACK) goto fallback;
-
+  int rc;
   {
     DevSlot slots[WARPJQ_MAX_SLOTS];
 #pragma unroll 1
@@ -1023,7 +1414,17 @@ __global__ void k_eval(const char *data, const unsigned int *line_off,
       slots[k].kind = JK_MISSING;
     }
 
-    rc = d_extract(line, n, p, slots);
+    // The fused walk validates the line as it resolves it, so the separate
+    // d_validate pass -- 37% of this kernel -- only runs for the shapes it
+    // declines. Where it does run it still runs *first*, so a line that is
+    // both malformed and type-erroring is still reported as malformed.
+    int fstart = 0;
+    if (d_fusable(line, n, p, &fstart)) {
+      rc = d_extract_object(line, n, p, slots, fstart);
+    } else {
+      rc = d_validate(line, n);
+      if (rc == 0) rc = d_extract_general(line, n, p, slots);
+    }
     if (rc == R_INVALID) {
       status[i] = WARPJQ_LINE_INVALID;
       atomicAdd(&ctr->n_invalid, 1ull);
@@ -1487,6 +1888,15 @@ struct Slot {
 
   int *d_nl_pos = nullptr;
   long long *d_n_nl = nullptr;
+  // Per-tile newline counts and their exclusive prefix sum, so k_nl_write
+  // knows where its block's run of positions starts. Sized for the largest
+  // chunk, plus one so the scan's last element is the grand total.
+  unsigned int *d_nl_counts = nullptr;
+  unsigned int *d_nl_base = nullptr;
+  // One 16-bit newline mask per 16 input bytes, handed from the count pass to
+  // the scatter pass so the input is only read once.
+  unsigned short *d_nl_masks = nullptr;
+  long long nl_blocks_cap = 0;
   unsigned int *d_line_off = nullptr;
   unsigned int *d_line_len = nullptr;
   unsigned char *d_status = nullptr;
@@ -1569,7 +1979,23 @@ static warpjq_status alloc_all(warpjq_ctx *ctx, char *err, size_t err_len) {
 
     CUDA_TRY(cudaHostAlloc(&sl.h_pinned, ctx->chunk_cap, cudaHostAllocDefault),
              "cudaHostAlloc(staging)");
-    CUDA_TRY(cudaMalloc(&sl.d_data, ctx->chunk_cap), "cudaMalloc(data)");
+    // WARPJQ_DATA_PAD of slack past the chunk so the staging copy in k_eval
+    // can issue 16-byte aligned loads that round out past the last line
+    // without running off the allocation.
+    CUDA_TRY(cudaMalloc(&sl.d_data, ctx->chunk_cap + WARPJQ_DATA_PAD),
+             "cudaMalloc(data)");
+    // Both the k_eval staging copy and the newline scan issue 16-byte aligned
+    // loads that can round past the last line into the pad. The bytes are
+    // masked off before use, but reading them at all is reading uninitialised
+    // memory -- compute-sanitizer --tool initcheck says so, and it is right.
+    // One memset at setup makes the whole buffer defined for the run.
+    // On sl.stream, NOT the default stream: these streams are created
+    // cudaStreamNonBlocking, so they do not synchronise with the NULL stream
+    // and a default-stream memset can land *after* the first chunk's H2D
+    // copy and erase it.
+    CUDA_TRY(cudaMemsetAsync(sl.d_data, 0, ctx->chunk_cap + WARPJQ_DATA_PAD,
+                             sl.stream),
+             "cudaMemset(data)");
 
     CUDA_TRY(cudaMalloc(&sl.d_nl_pos, ml * sizeof(int)), "cudaMalloc(nl_pos)");
     CUDA_TRY(cudaMalloc(&sl.d_n_nl, sizeof(long long)), "cudaMalloc(n_nl)");
@@ -1669,13 +2095,28 @@ static warpjq_status alloc_all(warpjq_ctx *ctx, char *err, size_t err_len) {
     // a placeholder count produces a buffer that works on small inputs and
     // fails with "invalid argument" once a chunk is big enough to need more
     // tiles, so it passes every quick test and breaks on real data.
+    // The newline scan is k_nl_count + an exclusive scan of per-tile counts +
+    // k_nl_write. One entry per tile, plus one so the scan's final element is
+    // the total newline count.
+    sl.nl_blocks_cap =
+        (long long)((ctx->chunk_cap + WARPJQ_NL_TILE - 1) / WARPJQ_NL_TILE) + 1;
+    CUDA_TRY(cudaMalloc(&sl.d_nl_counts,
+                        (size_t)sl.nl_blocks_cap * sizeof(unsigned int)),
+             "cudaMalloc(nl_counts)");
+    CUDA_TRY(cudaMalloc(&sl.d_nl_base,
+                        (size_t)sl.nl_blocks_cap * sizeof(unsigned int)),
+             "cudaMalloc(nl_base)");
+    CUDA_TRY(cudaMalloc(&sl.d_nl_masks,
+                        (size_t)sl.nl_blocks_cap * WARPJQ_NL_BLOCK *
+                            WARPJQ_NL_PER_THREAD * sizeof(unsigned short)),
+             "cudaMalloc(nl_masks)");
+
     size_t b1 = 0, b2 = 0;
-    IsNewline pred{sl.d_data};
     thrust::counting_iterator<int> counter(0);
-    cudaError_t e = cub::DeviceSelect::If(nullptr, b1, counter, sl.d_nl_pos,
-                                          sl.d_n_nl, (int)ctx->chunk_cap, pred);
+    cudaError_t e = cub::DeviceScan::ExclusiveSum(
+        nullptr, b1, sl.d_nl_counts, sl.d_nl_base, (int)sl.nl_blocks_cap);
     if (e != cudaSuccess) {
-      set_err(err, err_len, "cub::DeviceSelect::If(size)",
+      set_err(err, err_len, "cub::DeviceScan(newline size)",
               cudaGetErrorString(e));
       return WARPJQ_ERR_CUDA;
     }
@@ -1729,6 +2170,9 @@ static void free_slot(Slot &sl) {
   cudaFree(sl.d_agg);
   cudaFree(sl.d_groups);
   cudaFree(sl.d_n_groups);
+  cudaFree(sl.d_nl_counts);
+  cudaFree(sl.d_nl_base);
+  cudaFree(sl.d_nl_masks);
   cudaFree(sl.d_cub);
   cudaFree(sl.table.keys);
   cudaFree(sl.table.count);
@@ -1957,13 +2401,27 @@ warpjq_status warpjq_submit(warpjq_ctx *ctx, uint32_t slot, uint64_t n_bytes,
                            sizeof(unsigned int), st),
            "memset(first_invalid)");
 
-  // 1. Newline positions.
-  IsNewline pred{sl.d_data};
-  thrust::counting_iterator<int> counter(0);
+  // 1. Newline positions: count per tile, scan, then scatter. See the
+  //    k_nl_count comment for why this is not cub::DeviceSelect::If.
+  const long long nl_blocks =
+      (long long)((n_bytes + WARPJQ_NL_TILE - 1) / WARPJQ_NL_TILE);
+  thrust::counting_iterator<int> counter(0);  // still used by the row select
   size_t cub_bytes = sl.cub_bytes;
-  CUDA_TRY(cub::DeviceSelect::If(sl.d_cub, cub_bytes, counter, sl.d_nl_pos,
-                                 sl.d_n_nl, (int)n_bytes, pred, st),
-           "cub::DeviceSelect::If(newlines)");
+  // The scan runs over nl_blocks+1 entries so its last element is the total;
+  // that entry has to be zero for the total to come out right.
+  CUDA_TRY(cudaMemsetAsync(sl.d_nl_counts + nl_blocks, 0,
+                           sizeof(unsigned int), st),
+           "memset(nl_counts tail)");
+  k_nl_count<<<(unsigned)nl_blocks, WARPJQ_NL_BLOCK, 0, st>>>(
+      sl.d_data, (long long)n_bytes, sl.d_nl_counts, sl.d_nl_masks);
+  CUDA_TRY(cub::DeviceScan::ExclusiveSum(sl.d_cub, cub_bytes, sl.d_nl_counts,
+                                         sl.d_nl_base, (int)(nl_blocks + 1),
+                                         st),
+           "cub::DeviceScan(newlines)");
+  k_nl_write<<<(unsigned)nl_blocks, WARPJQ_NL_BLOCK, 0, st>>>(
+      (long long)n_bytes, sl.d_nl_base, sl.d_nl_masks, sl.d_nl_pos);
+  k_nl_total<<<1, 1, 0, st>>>(sl.d_nl_base, (unsigned int)nl_blocks,
+                              sl.d_n_nl);
 
   // The line count depends on whether the chunk ends with a newline. The
   // chunker guarantees it does except for the last chunk of a file, so read
@@ -2012,7 +2470,13 @@ warpjq_status warpjq_submit(warpjq_ctx *ctx, uint32_t slot, uint64_t n_bytes,
   }
 
   GroupTable table = ctx->needs_groups ? sl.table : GroupTable{};
-  k_eval<<<(unsigned)grid, B, 0, st>>>(
+  // k_eval has its own block size (it budgets shared memory per warp), so it
+  // needs its own grid. `grid` stays tied to WARPJQ_BLOCK because
+  // k_agg_reduce writes one partial per block and k_agg_final reads exactly
+  // `grid` of them.
+  const long long eval_grid =
+      (n_lines + WARPJQ_EVAL_BLOCK - 1) / WARPJQ_EVAL_BLOCK;
+  k_eval<<<(unsigned)eval_grid, WARPJQ_EVAL_BLOCK, 0, st>>>(
       sl.d_data, sl.d_line_off, sl.d_line_len, n_lines, ctx->prog, sl.d_status,
       sl.d_pass, sl.d_agg_value, sl.d_group_slot, table, sl.d_ctr,
       sl.d_fallback_idx, sl.d_fallback_off, sl.d_fallback_len,
