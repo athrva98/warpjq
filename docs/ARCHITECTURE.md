@@ -2,8 +2,7 @@
 
 This document explains the pipeline, the memory budget, and, where it
 matters, the measurement that produced each decision. Anything stated as a number here
-was measured on the development machine (RTX 5060 Laptop, sm_120, 8 GB;
-Windows 11; 1 GB `nginx` preset, warm page cache) and can be reproduced with
+was measured on an RTX 5060 Laptop GPU (sm_120, 8 GB) under Windows 11 with 1 GB `nginx` preset, warm page cache) and can be reproduced with
 `WARPJQ_PROFILE=1`.
 
 ---
@@ -153,7 +152,7 @@ notice. This is also what makes the GPU and CPU outputs comparable at the byte
 level: both hand back offsets into the same bytes.
 
 **Measured, not assumed.** The justification above was written from memory
-before jq was installed on the development machine, which is a bad way to
+before jq was installed, which is a bad way to
 justify a design. With jq 1.8.2 present it holds: jq preserves `1.0`, `0.10`,
 `100`, `9007199254740993` and the thirty-digit integer exactly. There is now a
 test (`jq_preserves_number_literals_like_warpjq_does`) that fails if a future jq
@@ -335,7 +334,7 @@ does the same work at ~2.8 GB/s. The gap between 20 GB/s of capability and
 pinned memory, plus ~0.15 s of one-time CUDA context and allocation cost.
 
 The consequence, stated plainly because it is the most useful thing this
-document contains: **on consumer laptop hardware, warpjq is input-bound, not
+document contains: **on this class of machine warpjq is input-bound, not
 compute-bound.** Optimising the kernels further would change nothing. The three
 things that would move the number are all in the input path, and they are the
 top three items on the roadmap.
