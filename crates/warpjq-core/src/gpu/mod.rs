@@ -145,41 +145,6 @@ impl Drop for GpuBackend {
 struct InFlight {
     slot: u32,
     n_bytes: usize,
-    /// Where this chunk's bytes live, for re-running declined lines on the
-    /// CPU. Either the pinned staging buffer or, on the zero-copy path, the
-    /// mapping itself. Valid until the slot is submitted again, which the
-    /// double-buffered loop guarantees has not happened yet.
-    src: *const u8,
-}
-
-/// A host range pinned for the duration of a run.
-///
-/// Registering the mapping lets the DMA engine read the file's page cache
-/// directly, which is what removes the staging copy. It is not free: the
-/// driver pins every page, so this is timed into the profile alongside the
-/// copy it replaces. Registration failing is not an error, it just means the
-/// run takes the staging path.
-struct HostPin(*const u8);
-
-impl HostPin {
-    fn new(ptr: *const u8, len: usize) -> Option<Self> {
-        // An escape hatch, so the staging path stays reachable from one binary
-        // for A/B measurement and for whatever platform this turns out to
-        // misbehave on.
-        if std::env::var_os("WARPJQ_NO_PIN").is_some() {
-            return None;
-        }
-        let mut err = ffi::ErrBuf::new();
-        let rc =
-            unsafe { ffi::warpjq_host_register(ptr, len as u64, err.as_mut_ptr(), err.len()) };
-        (rc == ffi::OK).then_some(HostPin(ptr))
-    }
-}
-
-impl Drop for HostPin {
-    fn drop(&mut self) {
-        unsafe { ffi::warpjq_host_unregister(self.0) };
-    }
 }
 
 /// Where the wall clock actually went, printed when `WARPJQ_PROFILE=1`.
@@ -192,8 +157,6 @@ impl Drop for HostPin {
 struct Profile {
     enabled: bool,
     read: std::time::Duration,
-    /// One-off cost of registering the input, paid instead of `stage_copy`.
-    pin: std::time::Duration,
     stage_copy: std::time::Duration,
     submit: std::time::Duration,
     wait: std::time::Duration,
@@ -223,7 +186,6 @@ impl Profile {
         };
         eprintln!("warpjq profile: {:.2} GB through the pipeline", gb);
         row("read+chunk (host)", self.read);
-        row("pin input (once)", self.pin);
         row("copy to pinned", self.stage_copy);
         row("submit (H2D+kernels)", self.submit);
         row("wait (sync+D2H)", self.wait);
@@ -263,17 +225,6 @@ impl Backend for GpuBackend {
 
         let ctx = self.ctx;
         let cap = self.chunk_cap;
-
-        // Pin the whole input once so every chunk DMAs straight out of it.
-        // Held for the run: unregistering while a chunk is in flight would
-        // pull the memory out from under the DMA engine.
-        let t_pin = std::time::Instant::now();
-        let _pin = input
-            .contiguous_region()
-            .and_then(|(p, n)| HostPin::new(p, n));
-        let pinned = _pin.is_some();
-        prof.pin = t_pin.elapsed();
-
         let mut last_return = std::time::Instant::now();
 
         let drain = |f: &InFlight,
@@ -339,17 +290,13 @@ impl Backend for GpuBackend {
             // Safe because the slot we are about to reuse was drained on the
             // previous iteration: with two slots, chunk n and chunk n-2 share
             // a slot and chunk n-2 was waited on while chunk n-1 was queued.
-            let src = match fill_and_submit(ctx, slot, chunk.data, pinned, &mut prof) {
-                Ok(p) => p,
-                Err(e) => {
-                    abort = Some(e);
-                    return Ok(0);
-                }
-            };
+            if let Err(e) = fill_and_submit(ctx, slot, chunk.data, &mut prof) {
+                abort = Some(e);
+                return Ok(0);
+            }
             let queued = InFlight {
                 slot,
                 n_bytes: chunk.data.len(),
-                src,
             };
 
             if let Some(prev) = in_flight.take() {
@@ -399,48 +346,23 @@ impl Backend for GpuBackend {
     }
 }
 
-/// Hands `data` to the device and returns the address the bytes will be read
-/// back from if any line has to be finished on the CPU.
-///
-/// When the input is pinned there is nothing to do but point the DMA engine at
-/// the mapping. Otherwise the bytes go through the slot's staging buffer,
-/// which costs a full pass over the chunk before the transfer can even start.
-fn fill_and_submit(
-    ctx: *mut ffi::Ctx,
-    slot: u32,
-    data: &[u8],
-    pinned: bool,
-    prof: &mut Profile,
-) -> Result<*const u8> {
-    let src = if pinned {
-        data.as_ptr()
-    } else {
-        let buf = unsafe { ffi::warpjq_slot_buffer(ctx, slot) };
-        if buf.is_null() {
-            return Err(WarpError::other("device staging buffer is unavailable"));
-        }
-        // Copy into pinned memory, in parallel. A single-threaded memcpy of a
-        // 64 MB chunk runs at roughly one memory channel's worth of bandwidth,
-        // which is the same order as the entire rest of the pipeline. Splitting
-        // it across cores makes it disappear behind the DMA instead.
-        let t = std::time::Instant::now();
-        copy_to_pinned(data, buf);
-        prof.stage_copy += t.elapsed();
-        buf as *const u8
-    };
+fn fill_and_submit(ctx: *mut ffi::Ctx, slot: u32, data: &[u8], prof: &mut Profile) -> Result<()> {
+    let buf = unsafe { ffi::warpjq_slot_buffer(ctx, slot) };
+    if buf.is_null() {
+        return Err(WarpError::other("device staging buffer is unavailable"));
+    }
+    // Copy into pinned memory, in parallel. A single-threaded memcpy of a
+    // 64 MB chunk runs at roughly one memory channel's worth of bandwidth,
+    // which is the same order as the entire rest of the pipeline. Splitting
+    // it across cores makes it disappear behind the DMA instead.
+    let t = std::time::Instant::now();
+    copy_to_pinned(data, buf);
+    prof.stage_copy += t.elapsed();
 
     let t = std::time::Instant::now();
     let mut err = ffi::ErrBuf::new();
-    let rc = unsafe {
-        ffi::warpjq_submit_from(
-            ctx,
-            slot,
-            src,
-            data.len() as u64,
-            err.as_mut_ptr(),
-            err.len(),
-        )
-    };
+    let rc =
+        unsafe { ffi::warpjq_submit(ctx, slot, data.len() as u64, err.as_mut_ptr(), err.len()) };
     if rc != ffi::OK {
         return Err(WarpError::Cuda {
             op: "submitting a chunk",
@@ -448,7 +370,7 @@ fn fill_and_submit(
         });
     }
     prof.submit += t.elapsed();
-    Ok(src)
+    Ok(())
 }
 
 /// Charges everything from construction to scope exit to `acc`, so the merge
@@ -520,10 +442,10 @@ fn drain_slot<W: Write>(
         acc: &mut prof.merge,
     };
 
-    // The chunk's bytes are still where they were submitted from, and stay
-    // there until this slot is submitted again, so that is the byte source for
-    // any line the kernel declined.
-    let data: &[u8] = unsafe { std::slice::from_raw_parts(f.src, f.n_bytes) };
+    // The staging buffer still holds this chunk's bytes and stays valid until
+    // the slot is refilled, so it is the byte source for fallback lines.
+    let data: &[u8] =
+        unsafe { std::slice::from_raw_parts(ffi::warpjq_slot_buffer(ctx, f.slot), f.n_bytes) };
 
     let first_line = *lines_seen + 1;
 

@@ -30,8 +30,8 @@ pub struct Chunk<'a> {
 
 /// Where the bytes come from.
 pub enum Input {
-    /// A regular file, mapped. Chunks borrow directly from the mapping, which
-    /// the GPU backend can pin and DMA from without staging them first.
+    /// A regular file, mapped. Chunks borrow directly from the mapping, so
+    /// there is no copy before the GPU staging buffer.
     Mapped { map: Mmap, name: String },
     /// stdin or anything else non-seekable, read into a growable buffer.
     Streamed {
@@ -96,21 +96,6 @@ impl Input {
             Input::Mapped { name, .. }
             | Input::Streamed { name, .. }
             | Input::Chained { name, .. } => name,
-        }
-    }
-
-    /// The whole input as one contiguous host range, when there is one.
-    ///
-    /// The GPU backend registers this with the driver so chunks can be DMA'd
-    /// straight out of the page cache instead of being copied into a pinned
-    /// staging buffer first. Only a single mapping qualifies: a stream has no
-    /// stable address, and a chain of files is several ranges rather than one.
-    pub fn contiguous_region(&self) -> Option<(*const u8, usize)> {
-        match self {
-            Input::Mapped { map, .. } if !map.is_empty() => {
-                Some((map.as_ptr(), map.len()))
-            }
-            _ => None,
         }
     }
 
