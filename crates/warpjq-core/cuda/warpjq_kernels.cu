@@ -1318,16 +1318,16 @@ __device__ int d_csv_emit(char *dst, const char *line, const DevSlot &s) {
 __global__ void k_row_len(const char *data, const unsigned int *line_off,
                           const unsigned int *line_len,
                           const unsigned int *sel_idx, const long long *n_sel,
-                          DevProgram p, unsigned long long *row_len) {
+                          DevProgram p, uint64_t *row_len) {
   long long k = blockIdx.x * (long long)blockDim.x + threadIdx.x;
   if (k >= *n_sel) return;
   unsigned int i = sel_idx[k];
   const char *line = data + line_off[i];
   int n = (int)line_len[i];
 
-  unsigned long long len = 0;
+  uint64_t len = 0;
   if (p.output_kind == WARPJQ_OUT_PASSTHROUGH) {
-    len = (unsigned long long)n + 1;
+    len = (uint64_t)n + 1;
   } else if (p.output_kind == WARPJQ_OUT_PATH) {
     warpjq_path pp = p.paths[p.output_path];
     DevSlot s;
@@ -1337,9 +1337,9 @@ __global__ void k_row_len(const char *data, const unsigned int *line_off,
       return;
     }
     if (p.csv_mode) {
-      len = (unsigned long long)d_csv_len(line, s) + 1;
+      len = (uint64_t)d_csv_len(line, s) + 1;
     } else {
-      len = (unsigned long long)(s.kind == JK_MISSING ? 4 : s.len) + 1;
+      len = (uint64_t)(s.kind == JK_MISSING ? 4 : s.len) + 1;
     }
   } else if (p.output_kind == WARPJQ_OUT_PROJECT) {
     for (unsigned int f = 0; f < p.n_fields; f++) {
@@ -1365,8 +1365,8 @@ __global__ void k_row_len(const char *data, const unsigned int *line_off,
 __global__ void k_emit(const char *data, const unsigned int *line_off,
                        const unsigned int *line_len,
                        const unsigned int *sel_idx, const long long *n_sel,
-                       DevProgram p, const unsigned long long *row_off,
-                       const unsigned long long *row_len,
+                       DevProgram p, const uint64_t *row_off,
+                       const uint64_t *row_len,
                        unsigned long long out_cap, ChunkCounters *ctr,
                        char *out) {
   long long k = blockIdx.x * (long long)blockDim.x + threadIdx.x;
@@ -1446,8 +1446,8 @@ __global__ void k_group_compact(GroupTable t, unsigned int n,
 
 // Sets the last prefix-sum entry so the host can read the total without a
 // separate reduction.
-__global__ void k_finish_offsets(const unsigned long long *row_len,
-                                 unsigned long long *row_off,
+__global__ void k_finish_offsets(const uint64_t *row_len,
+                                 uint64_t *row_off,
                                  const long long *n_sel) {
   long long n = *n_sel;
   row_off[n] = (n == 0) ? 0ull : row_off[n - 1] + row_len[n - 1];
@@ -1497,8 +1497,8 @@ struct Slot {
 
   unsigned int *d_sel_idx = nullptr;
   long long *d_n_sel = nullptr;
-  unsigned long long *d_row_len = nullptr;
-  unsigned long long *d_row_off = nullptr;
+  uint64_t *d_row_len = nullptr;
+  uint64_t *d_row_off = nullptr;
   char *d_out = nullptr;
 
   unsigned int *d_fallback_idx = nullptr;
@@ -1516,7 +1516,7 @@ struct Slot {
 
   // Pinned landing zones for results.
   unsigned int *h_sel_idx = nullptr;
-  unsigned long long *h_row_off = nullptr;
+  uint64_t *h_row_off = nullptr;
   unsigned char *h_out = nullptr;
   unsigned int *h_fallback_idx = nullptr;
   unsigned int *h_fallback_off = nullptr;
@@ -1629,15 +1629,15 @@ static warpjq_status alloc_all(warpjq_ctx *ctx, char *err, size_t err_len) {
     if (ctx->needs_output) {
       CUDA_TRY(cudaMalloc(&sl.d_sel_idx, ml * sizeof(unsigned int)),
                "cudaMalloc(sel_idx)");
-      CUDA_TRY(cudaMalloc(&sl.d_row_len, ml * sizeof(unsigned long long)),
+      CUDA_TRY(cudaMalloc(&sl.d_row_len, ml * sizeof(uint64_t)),
                "cudaMalloc(row_len)");
-      CUDA_TRY(cudaMalloc(&sl.d_row_off, (ml + 1) * sizeof(unsigned long long)),
+      CUDA_TRY(cudaMalloc(&sl.d_row_off, (ml + 1) * sizeof(uint64_t)),
                "cudaMalloc(row_off)");
       CUDA_TRY(cudaMalloc(&sl.d_out, ctx->out_cap), "cudaMalloc(out)");
       CUDA_TRY(cudaHostAlloc(&sl.h_sel_idx, ml * sizeof(unsigned int),
                              cudaHostAllocDefault),
                "cudaHostAlloc(sel_idx)");
-      CUDA_TRY(cudaHostAlloc(&sl.h_row_off, (ml + 1) * sizeof(unsigned long long),
+      CUDA_TRY(cudaHostAlloc(&sl.h_row_off, (ml + 1) * sizeof(uint64_t),
                              cudaHostAllocDefault),
                "cudaHostAlloc(row_off)");
       CUDA_TRY(cudaHostAlloc(&sl.h_out, ctx->out_cap, cudaHostAllocDefault),
@@ -2179,10 +2179,10 @@ warpjq_status warpjq_wait(warpjq_ctx *ctx, uint32_t slot,
   }
 
   CUDA_TRY(cudaMemcpy(sl.h_row_off, sl.d_row_off,
-                      (size_t)(n_sel + 1) * sizeof(unsigned long long),
+                      (size_t)(n_sel + 1) * sizeof(uint64_t),
                       cudaMemcpyDeviceToHost),
            "D2H(row offsets)");
-  unsigned long long total = sl.h_row_off[n_sel];
+  uint64_t total = sl.h_row_off[n_sel];
   if (total > ctx->out_cap) {
     // Belt and braces: k_emit already refuses to store a row that would not
     // fit, so reaching here means the device state is not what we expect --
