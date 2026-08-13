@@ -1,0 +1,33 @@
+[package]
+name = "warpjq-core"
+description = "Query compiler and CPU/GPU execution engines for warpjq"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+ryu.workspace = true
+itoa.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+
+[features]
+# `cuda` is opt-in at build time. Without it the crate builds and runs
+# everywhere with the CPU backend only, which is what makes `cargo install`
+# work for people who have never touched a GPU.
+default = []
+cuda = []
+
+[dev-dependencies]
+rand.workspace = true
+rand_chacha.workspace = true

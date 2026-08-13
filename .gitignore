@@ -1,0 +1,6 @@
+/target
+/bench-data
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+*.ndjson

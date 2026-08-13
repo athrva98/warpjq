@@ -1,0 +1,17 @@
+# Normalise to LF in the repository and in the working tree.
+#
+# Without this, a clone on Windows gets CRLF, and `scripts/install.sh` then
+# ships with a `#!/usr/bin/env sh\r` shebang that Linux rejects with a
+# "bad interpreter" error. The curl-pipe-sh install path depends on this.
+* text=auto eol=lf
+
+*.rs    text eol=lf
+*.cu    text eol=lf
+*.h     text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.sh    text eol=lf
+
+*.png   binary
+*.gif   binary

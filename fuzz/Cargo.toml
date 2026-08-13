@@ -1,0 +1,42 @@
+[package]
+name = "warpjq-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+warpjq-core = { path = "../crates/warpjq-core" }
+
+[[bin]]
+name = "parse_line"
+path = "fuzz_targets/parse_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "query"
+path = "fuzz_targets/query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "run_ndjson"
+path = "fuzz_targets/run_ndjson.rs"
+test = false
+doc = false
+bench = false
+
+# Fuzzing wants the same optimisation level as release so the code under test
+# is the code that ships, but with debug assertions on to catch slicing bugs.
+[profile.release]
+debug = true
+debug-assertions = true
+overflow-checks = true
+
+[workspace]

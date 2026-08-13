@@ -1,0 +1,22 @@
+[package]
+name = "warpjq-cli"
+description = "A single-binary CLI that filters, projects and aggregates NDJSON using a subset of jq syntax. CUDA-accelerated, with a multi-core CPU fallback so it runs with or without an NVIDIA GPU. Every result is differentially tested against jq itself on fuzzed input."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "warpjq"
+path = "src/main.rs"
+
+[dependencies]
+warpjq-core = { path = "../warpjq-core", version = "0.1.0" }
+clap.workspace = true
+anyhow.workspace = true
+
+[features]
+default = []
+cuda = ["warpjq-core/cuda"]
