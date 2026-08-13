@@ -197,9 +197,14 @@ typedef struct {
   /* Byte offset of each row within out_bytes; n_selected + 1 entries. */
   const uint64_t *out_row_off;
 
-  /* Lines the kernel declined, ascending, with their byte ranges so the host
-   * can re-run just those on the CPU and splice the rows back into place.
-   * These three arrays are parallel and n_fallback long. */
+  /* Lines the kernel declined, with their byte ranges so the host can re-run
+   * just those on the CPU and splice the rows back into place. Three parallel
+   * arrays, n_fallback long.
+   *
+   * NOT sorted. The kernel appends with an atomicAdd, so these arrive in
+   * whatever order the blocks retired, and the consumer sorts. Enforcing it
+   * here as well would put one invariant in two places with neither site
+   * aware of the other, which is how both eventually get removed. */
   const uint32_t *fallback_idx;
   const uint32_t *fallback_off;
   const uint32_t *fallback_len;

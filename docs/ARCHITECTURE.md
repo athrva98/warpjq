@@ -202,6 +202,105 @@ PCIe is not the constraint. An earlier version of this document predicted a
 full x16 link would change the result; L40S, A100 and H100 at gen 4 and gen 5
 x16, verified under load, did not.
 
+## Benchmarks
+
+1 GB of `gen --preset nginx --seed 1`, warm cache, best of three, end-to-end
+wall clock including the file read.
+
+RTX 5060 Laptop (sm_120), Windows 11, against jq 1.8.2:
+
+| query | gpu | cpu | jq |
+|---|---|---|---|
+| `select(.status == 500) \| count` | 0.25 s | 0.33 s | 30.5 s |
+| `select(.status == 500) \| sum(.bytes)` | 0.26 s | 0.34 s | 30.6 s |
+| `select(.status >= 500) \| {p: .path, b: .bytes}` | 0.36 s | 0.34 s | 40.1 s |
+| `select(.status == 500)` | 0.38 s | 0.34 s | 39.6 s |
+| `group_by(.host) \| count` (200 MB) | 0.23 s | 0.07 s | 12.0 s |
+
+`group_by` uses a smaller file because it makes jq slurp the whole input into
+memory as parsed JSON.
+
+GPU against CPU by input size, `select(.status == 500) | count`, H100 80 GB
+with 8 host cores:
+
+| input | gpu | cpu | ratio |
+|---|---|---|---|
+| 1 MB | 0.217 s | 0.006 s | 0.03x |
+| 200 MB | 0.223 s | 0.061 s | 0.27x |
+| 1 GB | 0.286 s | 0.254 s | 0.89x |
+| 2 GB | 0.845 s | 1.180 s | 1.40x |
+| 4 GB | 1.417 s | 2.455 s | 1.73x |
+| 8 GB | 2.719 s | 5.451 s | 2.00x |
+
+Per-device, same 1 GB file, 8 host cores, PCIe sampled under load:
+
+| device | cc | PCIe | kernels | host copy |
+|---|---|---|---|---|
+| RTX 5060 Laptop | 12.0 | gen 4 x8 | 20.2 GB/s | 7.0 GB/s |
+| L40S | 8.9 | gen 4 x16 | 14.3 GB/s | 19.9 GB/s |
+| A100 SXM4 40 GB | 8.0 | gen 4 x16 | 11.9 GB/s | 9.7 GB/s |
+| H100 80 GB HBM3 | 9.0 | gen 5 x16 | 29.4 GB/s | 21.8 GB/s |
+
+Reproduce with `warpjq bench`, or `scripts/modal_ab.py` for the datacentre
+parts, which builds two commits into one image and compares them on one
+device.
+
+## Differences from jq
+
+Measured against jq 1.8.2 and checked in CI. Semantics match: filtering,
+grouping and every aggregate agree, including across different spellings of
+the same string.
+
+Rendering differs because warpjq returns slices of the input where jq
+re-serialises. Numbers agree on jq 1.7 and later, which preserves literals;
+jq 1.6 prints `123456789012345678901234567890` as
+`123456789012345680000000000000`.
+
+| input | jq | warpjq |
+|---|---|---|
+| `{"s":"\u0041"}` | `"A"` | `"\u0041"` |
+| `{"s":"\/slash"}` | `"/slash"` | `"\/slash"` |
+| `{"a":1e3}` | `1E+3` | `1e3` |
+
+Normalising would mean re-serialising every value, which costs the number
+fidelity above.
+
+Validity differs in the other direction. jq accepts documents RFC 8259
+forbids and rewrites the value rather than reporting an error:
+
+| input | jq | warpjq |
+|---|---|---|
+| `{"a":01}` | `{"a":1}` | rejects |
+| `{"a":-01}` | `{"a":-1}` | rejects |
+| `{"a":+1}` | `{"a":1}` | rejects |
+| `{"a":.5}` | `{"a":0.5}` | rejects |
+| `{"a":1.}` | `{"a":1}` | rejects |
+| `{"a":Infinity}` | `1.797...e+308` | rejects |
+| `{"a":NaN}` | `null` | rejects |
+| `{"a":1}{"b":2}` | two values | rejects |
+
+The last is a model difference: jq reads a stream of values, NDJSON is one
+value per line. Conversely warpjq accepts a lone high surrogate
+(`"\ud83d"`) and a reversed pair, which jq rejects; a lone low surrogate is
+accepted by both.
+
+`tests/conformance.rs` asserts this divergence set exactly, so a new one
+fails the build rather than going unnoticed.
+
+## Testing
+
+| suite | asserts |
+|---|---|
+| `differential` | GPU output equals CPU output byte for byte on fuzzed input, ~40 queries by 3 formats, at chunk sizes that force multi-chunk paths and slot reuse; and equals jq on a corpus excluding the spellings above |
+| `conformance` | 48 must-accept and 52 must-reject documents through the scanner, both backends and jq |
+| `invariants` | output unchanged across chunk size 1 B to 16 MB, thread count 1 to 32, format and backend |
+| `cli` | exit codes, stdin, multiple files, every flag, error paths |
+| fuzz | scanner, query compiler, and a full end-to-end run over arbitrary bytes |
+
+Release builds compile out `debug_assert!`, so CI runs the suite in both
+profiles. A contract violation guarded that way was invisible to the release
+run and only surfaced through fuzzing, which builds with debug assertions on.
+
 ## Measurement notes
 
 `nvidia-smi` reports idle link and clock state. A card at rest downclocks to

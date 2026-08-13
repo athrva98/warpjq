@@ -2597,23 +2597,6 @@ warpjq_status warpjq_wait(warpjq_ctx *ctx, uint32_t slot,
     CUDA_TRY(cudaMemcpy(sl.h_fallback_len, sl.d_fallback_len,
                         nfb * sizeof(unsigned int), cudaMemcpyDeviceToHost),
              "D2H(fallback len)");
-    // The kernel appends in completion order; the host merge needs ascending
-    // line indices. Sorting a handful of entries on the host is cheaper than
-    // a device sort, and fallbacks are rare by construction.
-    for (unsigned int i = 1; i < nfb; i++) {
-      unsigned int ki = sl.h_fallback_idx[i], ko = sl.h_fallback_off[i],
-                   kl = sl.h_fallback_len[i];
-      int j = (int)i - 1;
-      while (j >= 0 && sl.h_fallback_idx[j] > ki) {
-        sl.h_fallback_idx[j + 1] = sl.h_fallback_idx[j];
-        sl.h_fallback_off[j + 1] = sl.h_fallback_off[j];
-        sl.h_fallback_len[j + 1] = sl.h_fallback_len[j];
-        j--;
-      }
-      sl.h_fallback_idx[j + 1] = ki;
-      sl.h_fallback_off[j + 1] = ko;
-      sl.h_fallback_len[j + 1] = kl;
-    }
   }
   out->fallback_idx = sl.h_fallback_idx;
   out->fallback_off = sl.h_fallback_off;
