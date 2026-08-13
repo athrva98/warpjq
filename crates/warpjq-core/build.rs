@@ -55,12 +55,13 @@ fn main() {
     let mut cmd = Command::new(&nvcc);
     cmd.arg("--lib").arg("-o").arg(&lib_path);
 
-    for arch in arch_list() {
+    let archs = arch_list(&nvcc);
+    for arch in &archs {
         // Real SASS for each listed arch...
         cmd.arg(format!("-gencode=arch=compute_{arch},code=sm_{arch}"));
     }
     // ...plus PTX for the newest one, so unknown future GPUs still run.
-    if let Some(newest) = arch_list().last() {
+    if let Some(newest) = archs.last() {
         cmd.arg(format!(
             "-gencode=arch=compute_{newest},code=compute_{newest}"
         ));
@@ -133,15 +134,87 @@ fn main() {
     }
 }
 
-fn arch_list() -> Vec<String> {
-    match env::var("WARPJQ_CUDA_ARCH") {
-        Ok(s) if !s.trim().is_empty() => s
-            .split(',')
-            .map(|a| a.trim().trim_start_matches("sm_").to_string())
-            .filter(|a| !a.is_empty())
-            .collect(),
-        _ => DEFAULT_ARCHS.iter().map(|s| s.to_string()).collect(),
+/// Architectures this nvcc will actually accept, from `nvcc --list-gpu-arch`.
+///
+/// Returns an empty vec if the flag is unavailable, in which case the caller
+/// does no filtering and lets nvcc decide.
+fn supported_archs(nvcc: &Path) -> Vec<String> {
+    let out = match Command::new(nvcc).arg("--list-gpu-arch").output() {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("compute_").map(str::to_string))
+        .collect()
+}
+
+/// The architectures to compile for.
+///
+/// The default list spans several toolkit generations, and an older toolkit
+/// rejects the newest entry outright: CUDA 12.6 fails with
+/// `nvcc fatal: Unsupported gpu architecture 'compute_120'`, which made
+/// `--features cuda` unbuildable on every toolkit before 12.8 rather than
+/// simply building without Blackwell support. So the defaults are filtered to
+/// what this nvcc knows.
+///
+/// An explicit `WARPJQ_CUDA_ARCH` is never filtered. Asking for an
+/// architecture the toolkit cannot produce is an error worth reporting, not
+/// one worth silently working around.
+fn arch_list(nvcc: &Path) -> Vec<String> {
+    if let Ok(s) = env::var("WARPJQ_CUDA_ARCH") {
+        if !s.trim().is_empty() {
+            let asked: Vec<String> = s
+                .split(',')
+                .map(|a| a.trim().trim_start_matches("sm_").to_string())
+                .filter(|a| !a.is_empty())
+                .collect();
+            let supported = supported_archs(nvcc);
+            if !supported.is_empty() {
+                for a in &asked {
+                    if !supported.contains(a) {
+                        panic!(
+                            "WARPJQ_CUDA_ARCH asks for sm_{a}, which this CUDA \
+                             toolkit does not support.\nIt accepts: {}.",
+                            supported.join(", ")
+                        );
+                    }
+                }
+            }
+            return asked;
+        }
     }
+
+    let supported = supported_archs(nvcc);
+    if supported.is_empty() {
+        return DEFAULT_ARCHS.iter().map(|s| s.to_string()).collect();
+    }
+    let usable: Vec<String> = DEFAULT_ARCHS
+        .iter()
+        .filter(|a| supported.contains(&a.to_string()))
+        .map(|s| s.to_string())
+        .collect();
+    if usable.is_empty() {
+        panic!(
+            "none of the default architectures ({}) are supported by this CUDA \
+             toolkit, which accepts: {}.\nSet WARPJQ_CUDA_ARCH to one of those.",
+            DEFAULT_ARCHS.join(", "),
+            supported.join(", ")
+        );
+    }
+    if usable.len() < DEFAULT_ARCHS.len() {
+        let dropped: Vec<&str> = DEFAULT_ARCHS
+            .iter()
+            .filter(|a| !usable.contains(&a.to_string()))
+            .copied()
+            .collect();
+        println!(
+            "cargo:warning=CUDA toolkit does not support sm_{}; building for sm_{} only",
+            dropped.join(", sm_"),
+            usable.join(", sm_")
+        );
+    }
+    usable
 }
 
 fn cuda_link_dirs(root: &Path) -> Vec<PathBuf> {

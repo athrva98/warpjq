@@ -52,6 +52,12 @@ jobs:
       - name: Tests
         run: cargo test --workspace --release
 
+      - name: Tests with debug assertions
+        # The release profile compiles out debug_assert!, so contract
+        # violations it guards are invisible to the run above. The fuzz
+        # targets build with debug-assertions on and found one that way.
+        run: cargo test --workspace
+
       - name: Differential tests (CPU vs jq)
         run: cargo test -p warpjq-core --release --test differential -- --nocapture
 

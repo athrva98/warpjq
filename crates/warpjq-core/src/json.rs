@@ -528,6 +528,12 @@ fn object_get(b: &[u8], i: usize, key: &[u8]) -> Result<Option<(usize, usize)>, 
     let mut found = None;
     loop {
         j = skip_ws(b, j);
+        // skip_string's precondition is that b[j] is a quote, asserted there
+        // with a debug_assert that release builds compile out. Without this
+        // guard, `{` alone indexes one past the end.
+        if b.get(j) != Some(&b'"') {
+            return Err(JsonError::at(j, "expected a string key"));
+        }
         let key_start = j;
         j = skip_string(b, j)?;
         let key_raw = &b[key_start + 1..j - 1];
@@ -786,6 +792,49 @@ mod tests {
         let s = get(r#"{"a":{"b":[1,2]},"c":0}"#, &[key("a")]);
         assert_eq!(s.kind, Kind::Obj);
         assert_eq!(s.raw, br#"{"b":[1,2]}"#);
+    }
+
+    #[test]
+    fn truncated_containers_error_rather_than_indexing_past_the_end() {
+        // `{` alone: object_get called skip_string with j == len. skip_string
+        // documents that precondition with a debug_assert, which release
+        // builds compile out, so this was an out-of-bounds panic under debug
+        // assertions and a misleading "unterminated string" otherwise. Found
+        // by the parse_line fuzz target, whose profile enables them.
+        for doc in [
+            "{",
+            "{ ",
+            "{	",
+            "[",
+            "[ ",
+            "{\"a\"",
+            "{\"a\":",
+            "{\"a\":1,",
+            "{\"a\":1,\"",
+            "[1,",
+            "[1,2",
+            "{\"",
+        ] {
+            assert!(validate(doc.as_bytes()).is_err(), "should reject {doc:?}");
+            // And every lookup shape must return, not panic.
+            for steps in [
+                vec![],
+                vec![Step::Key(String::new())],
+                vec![Step::Key("a".into())],
+                vec![Step::Index(0)],
+                vec![Step::Index(u32::MAX)],
+            ] {
+                match lookup(doc.as_bytes(), &steps) {
+                    Lookup::Found(_) | Lookup::TypeError(_) | Lookup::Invalid(_) => {}
+                }
+            }
+        }
+        // The specific message, so the guard is not silently removed and
+        // replaced by the fall-through that produced the wrong one.
+        match lookup(b"{", &[Step::Key("a".into())]) {
+            Lookup::Invalid(e) => assert_eq!(e.detail, "expected a string key"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]
