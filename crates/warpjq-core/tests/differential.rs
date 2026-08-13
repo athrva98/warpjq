@@ -44,19 +44,48 @@ const KEYS: &[&str] = &[
 ];
 const HOSTS: &[&str] = &["a", "b", "c", "web-01", "ünïcøde", "with\\\"quote", "日本"];
 
+/// Which awkward spellings a corpus is allowed to contain.
+///
+/// Both flags exist to keep the jq oracle honest. Excluding a spelling is
+/// fine; excluding it silently is not, so each flag names what it drops and
+/// why, and a separate test asserts the difference it is compensating for.
+#[derive(Copy, Clone, Debug)]
+struct CorpusOpts {
+    /// `\uXXXX`, `\/` and exponent-form numbers, which jq rewrites on output
+    /// at every version.
+    renormalised: bool,
+    /// Number literals only jq 1.7 and later preserve: integers past 2^53,
+    /// trailing-zero decimals, and `1.0`. jq 1.6 prints these through a
+    /// double and loses digits.
+    fragile_numbers: bool,
+}
+
+impl CorpusOpts {
+    /// Everything. Used for CPU-versus-GPU comparisons, where both engines
+    /// must agree exactly whatever the input looks like.
+    fn all() -> CorpusOpts {
+        CorpusOpts {
+            renormalised: true,
+            fragile_numbers: true,
+        }
+    }
+
+    /// Only what the installed jq reproduces byte for byte.
+    fn for_jq() -> CorpusOpts {
+        CorpusOpts {
+            renormalised: false,
+            fragile_numbers: jq_preserves_number_literals(),
+        }
+    }
+}
+
 /// Values chosen to sit on the edges every JSON implementation gets wrong.
 ///
-/// `renormalised` controls whether spellings that **jq rewrites on output**
-/// appear: `\uXXXX` escapes, `\/`, and exponent-form numbers. warpjq preserves
-/// all three; jq normalises them. That is a documented, deliberate difference
-/// (see `rendering_differences_from_jq_are_documented`), so those spellings are
-/// kept out of any corpus used as a jq oracle rather than left in to be
-/// rediscovered by every fuzzed comparison.
-///
-/// They are still exercised heavily in CPU-vs-GPU comparisons, where both
-/// engines must agree exactly.
-fn hard_value(rng: &mut ChaCha8Rng, depth: u32, renormalised: bool) -> String {
-    if renormalised && rng.gen_range(0..14) == 0 {
+/// See [`CorpusOpts`] for what each flag drops and why. Everything dropped
+/// from the jq oracle is still exercised in the CPU-versus-GPU comparison,
+/// where both engines must agree exactly regardless of what jq does.
+fn hard_value(rng: &mut ChaCha8Rng, depth: u32, opts: CorpusOpts) -> String {
+    if opts.renormalised && rng.gen_range(0..14) == 0 {
         return [
             r#""\u0041""#,
             r#""\u00e9""#,
@@ -73,21 +102,33 @@ fn hard_value(rng: &mut ChaCha8Rng, depth: u32, renormalised: bool) -> String {
         2 => "false".into(),
         3 => "0".into(),
         4 => "-0".into(),
-        // Past 2^53: a DOM that round-trips through f64 loses digits here.
-        5 => "9007199254740993".into(),
-        6 => "123456789012345678901234567890".into(),
+        // Past 2^53, where a round-trip through f64 loses digits. jq only
+        // stopped doing that in 1.7.
+        5 => if opts.fragile_numbers {
+            "9007199254740993"
+        } else {
+            "9007199254740"
+        }
+        .into(),
+        6 => if opts.fragile_numbers {
+            "123456789012345678901234567890"
+        } else {
+            "1234567890"
+        }
+        .into(),
         // jq rewrites exponent notation (`1e3` becomes `1E+3`) while warpjq
         // preserves the spelling, so these only appear in corpora that are
         // not used as a jq oracle. The difference itself is asserted by
         // `jq_preserves_number_literals_like_warpjq_does`.
-        7 => if renormalised { "1e3" } else { "1000" }.into(),
-        8 => if renormalised {
+        7 => if opts.renormalised { "1e3" } else { "1000" }.into(),
+        8 => if opts.renormalised {
             "-2.5E+10"
         } else {
             "-25000000000"
         }
         .into(),
-        9 => "1.0".into(),
+        // jq 1.6 prints `1.0` as `1`.
+        9 => if opts.fragile_numbers { "1.0" } else { "1" }.into(),
         10 => "0.1".into(),
         11 => r#""""#.into(),
         12 => r#""plain""#.into(),
@@ -103,9 +144,7 @@ fn hard_value(rng: &mut ChaCha8Rng, depth: u32, renormalised: bool) -> String {
                 format!("{}", rng.gen_range(0..1000))
             } else if rng.gen_bool(0.5) {
                 let n = rng.gen_range(0..4);
-                let items: Vec<String> = (0..n)
-                    .map(|_| hard_value(rng, depth - 1, renormalised))
-                    .collect();
+                let items: Vec<String> = (0..n).map(|_| hard_value(rng, depth - 1, opts)).collect();
                 format!("[{}]", items.join(","))
             } else {
                 let n = rng.gen_range(1..4);
@@ -114,7 +153,7 @@ fn hard_value(rng: &mut ChaCha8Rng, depth: u32, renormalised: bool) -> String {
                         format!(
                             "{:?}:{}",
                             KEYS[(i as usize) % KEYS.len()],
-                            hard_value(rng, depth - 1, renormalised)
+                            hard_value(rng, depth - 1, opts)
                         )
                     })
                     .collect();
@@ -126,18 +165,18 @@ fn hard_value(rng: &mut ChaCha8Rng, depth: u32, renormalised: bool) -> String {
 
 /// One well-formed line with a predictable outer shape, so queries can
 /// actually reach into it, and hostile values inside.
-fn good_line(rng: &mut ChaCha8Rng, renormalised: bool) -> String {
+fn good_line(rng: &mut ChaCha8Rng, opts: CorpusOpts) -> String {
     let status = [200, 301, 404, 500, 503][rng.gen_range(0..5)];
     let host = HOSTS[rng.gen_range(0..HOSTS.len())];
     format!(
         r#"{{"status":{status},"bytes":{},"host":{:?},"msg":{},"nested":{{"deep":{{"v":{}}}}},"arr":[{},{},{}],"flag":{},"n":{}}}"#,
         rng.gen_range(0..100000),
         host,
-        hard_value(rng, 1, renormalised),
+        hard_value(rng, 1, opts),
         rng.gen_range(0..500),
-        hard_value(rng, 0, renormalised),
+        hard_value(rng, 0, opts),
         rng.gen_range(0..10),
-        hard_value(rng, 0, renormalised),
+        hard_value(rng, 0, opts),
         if rng.gen_bool(0.3) {
             "null"
         } else if rng.gen_bool(0.5) {
@@ -145,7 +184,7 @@ fn good_line(rng: &mut ChaCha8Rng, renormalised: bool) -> String {
         } else {
             "false"
         },
-        hard_value(rng, 2, renormalised),
+        hard_value(rng, 2, opts),
     )
 }
 
@@ -169,22 +208,16 @@ fn malformed_line(rng: &mut ChaCha8Rng) -> String {
 
 /// Builds a corpus. `bad_ratio` is the fraction of lines that are malformed.
 fn corpus(seed: u64, lines: usize, bad_ratio: f64, crlf: bool) -> Vec<u8> {
-    corpus_inner(seed, lines, bad_ratio, crlf, true)
+    corpus_inner(seed, lines, bad_ratio, crlf, CorpusOpts::all())
 }
 
 /// A corpus safe to compare against jq: none of the spellings jq rewrites on
 /// output (`\uXXXX`, `\/`, exponent-form numbers).
 fn jq_corpus(seed: u64, lines: usize) -> Vec<u8> {
-    corpus_inner(seed, lines, 0.0, false, false)
+    corpus_inner(seed, lines, 0.0, false, CorpusOpts::for_jq())
 }
 
-fn corpus_inner(
-    seed: u64,
-    lines: usize,
-    bad_ratio: f64,
-    crlf: bool,
-    renormalised: bool,
-) -> Vec<u8> {
+fn corpus_inner(seed: u64, lines: usize, bad_ratio: f64, crlf: bool, opts: CorpusOpts) -> Vec<u8> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut out = String::new();
     for i in 0..lines {
@@ -198,7 +231,7 @@ fn corpus_inner(
         if rng.gen_bool(bad_ratio) {
             out.push_str(&malformed_line(&mut rng));
         } else {
-            out.push_str(&good_line(&mut rng, renormalised));
+            out.push_str(&good_line(&mut rng, opts));
         }
         out.push('\n');
     }
@@ -537,6 +570,30 @@ fn jq_path() -> Option<String> {
     s.lines().next().map(|l| l.trim().to_string())
 }
 
+/// The installed jq's version as (major, minor), if jq is present.
+fn jq_version() -> Option<(u32, u32)> {
+    let jq = jq_path()?;
+    let out = Command::new(jq).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // "jq-1.6", "jq-1.7.1", and 1.8 onwards print "jq-1.8.2".
+    let v = text.trim().trim_start_matches("jq-");
+    let mut parts = v.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    Some((major, minor))
+}
+
+/// True when the installed jq echoes number literals back unchanged.
+///
+/// jq 1.6 parses every number into a double and re-prints it, so
+/// `123456789012345678901234567890` comes back as
+/// `123456789012345680000000000000` and `1.0` as `1`. jq 1.7 keeps the
+/// original text when the value is not modified. Ubuntu 22.04 still ships
+/// 1.6, so this is not a hypothetical.
+fn jq_preserves_number_literals() -> bool {
+    jq_version().map(|v| v >= (1, 7)).unwrap_or(true)
+}
+
 /// Runs jq over `data`, via a temporary file rather than a pipe.
 ///
 /// Feeding jq through stdin deadlocks: this writes the whole corpus before
@@ -735,6 +792,17 @@ fn jq_preserves_number_literals_like_warpjq_does() {
         eprintln!("differential: SKIPPING the number comparison: jq is not on PATH");
         return;
     };
+    let modern = jq_preserves_number_literals();
+    eprintln!(
+        "differential: jq {:?} {} preserve number literals",
+        jq_version(),
+        if modern { "does" } else { "does NOT" }
+    );
+
+    // warpjq preserves all of these unconditionally, because it never builds
+    // a DOM. Whether jq agrees depends on its version, so assert the actual
+    // behaviour in both directions rather than the behaviour of whichever jq
+    // happened to be installed when the test was written.
     for lit in [
         "1.0",
         "-0.0",
@@ -744,18 +812,46 @@ fn jq_preserves_number_literals_like_warpjq_does() {
         "123456789012345678901234567890",
     ] {
         let data = format!("{{\"a\":{lit}}}\n");
-        let got_jq = run_jq(&jq, &["-c"], ".a", data.as_bytes()).unwrap();
-        assert_eq!(
-            got_jq.trim(),
-            lit,
-            "jq no longer preserves `{lit}`; the no-DOM rationale needs revisiting"
-        );
         let got = run(".a", data.as_bytes(), Format::Ndjson, Preference::Cpu);
         assert_eq!(got.trim(), lit, "warpjq no longer preserves `{lit}`");
+
+        let got_jq = run_jq(&jq, &["-c"], ".a", data.as_bytes()).unwrap();
+        if modern {
+            assert_eq!(
+                got_jq.trim(),
+                lit,
+                "jq {:?} no longer preserves `{lit}`; the no-DOM rationale \
+                 needs revisiting",
+                jq_version()
+            );
+        } else if lit == "100" {
+            // Small integers survive a double round-trip intact even on 1.6.
+            assert_eq!(got_jq.trim(), lit);
+        }
     }
-    // The one number case that does diverge: jq canonicalises the exponent.
+
+    // jq 1.6 destroys precision that warpjq keeps. Assert that concretely, so
+    // the README's claim about the no-DOM design is backed on old jq too.
+    if !modern {
+        let data = b"{\"a\":123456789012345678901234567890}\n";
+        let got_jq = run_jq(&jq, &["-c"], ".a", data).unwrap();
+        assert_ne!(
+            got_jq.trim(),
+            "123456789012345678901234567890",
+            "jq {:?} was expected to lose digits here",
+            jq_version()
+        );
+        assert_eq!(
+            run(".a", data, Format::Ndjson, Preference::Cpu).trim(),
+            "123456789012345678901234567890"
+        );
+    }
+
+    // Exponent notation diverges at every jq version, differently.
+    // 1.7 and later canonicalise the spelling; 1.6 evaluates it.
     let data = b"{\"a\":1e3}\n";
-    assert_eq!(run_jq(&jq, &["-c"], ".a", data).unwrap().trim(), "1E+3");
+    let got_jq = run_jq(&jq, &["-c"], ".a", data).unwrap();
+    assert_eq!(got_jq.trim(), if modern { "1E+3" } else { "1000" });
     assert_eq!(
         run(".a", data, Format::Ndjson, Preference::Cpu).trim(),
         "1e3"

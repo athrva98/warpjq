@@ -20,7 +20,7 @@ import subprocess
 import modal
 
 # Pin the commit so a re-run measures the same code.
-COMMIT = "ea240e4af479aaaf4a0b0a733a89f34a6d39e13c"
+COMMIT = "8e13ea2fc1af95e8cbe2214605484decef3c95c6"
 REPO = "https://github.com/athrva98/warpjq"
 
 # sm_80 A100, sm_89 L40S and Ada, sm_90 H100/H200.
@@ -30,7 +30,7 @@ app = modal.App("warpjq-bench")
 
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.6.2-devel-ubuntu22.04", add_python="3.11"
+        "nvidia/cuda:12.6.2-devel-ubuntu24.04", add_python="3.11"
     )
     .apt_install("git", "curl", "build-essential", "jq", "pkg-config", "bc")
     .run_commands(
@@ -81,6 +81,33 @@ def device_facts() -> dict:
     return dict(zip(keys, [v.strip() for v in out.split(",")]))
 
 
+def pcie_under_load(warpjq: str, path: str) -> str:
+    """PCIe link state sampled while a transfer is actually running.
+
+    An idle card downclocks its link, so `nvidia-smi` at rest reports
+    something like "gen 1 x8" on a card wired for gen 4 x16. Reading it
+    during a run is the only way to know what the transfers actually got.
+    """
+    proc = subprocess.Popen(
+        ["bash", "-lc",
+         f". $HOME/.cargo/env && cd /warpjq && for i in 1 2 3 4 5; do "
+         f"{warpjq} 'select(.status == 500) | count' --backend gpu {path} "
+         "> /dev/null; done"],
+    )
+    best = ""
+    while proc.poll() is None:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=pcie.link.gen.current,pcie.link.width.current",
+             "--format=csv,noheader"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if out and out > best:
+            best = out
+    proc.wait()
+    return best
+
+
 def run_on_device(label: str) -> dict:
     result = {"gpu": label, "device": device_facts()}
 
@@ -114,6 +141,8 @@ def run_on_device(label: str) -> dict:
     sh(f"{W} gen --preset nginx --size 1GB -o /tmp/big.ndjson --seed 1")
     sh(f"{W} gen --preset nginx --size 200MB -o /tmp/small.ndjson --seed 1")
     sh("cat /tmp/big.ndjson > /dev/null")
+
+    result["pcie_under_load"] = pcie_under_load(W, "/tmp/big.ndjson")
 
     # Per-stage profile, which is where the laptop result came from.
     print(f"[{label}] profiling", flush=True)
@@ -178,17 +207,17 @@ def run_on_device(label: str) -> dict:
     return result
 
 
-@app.function(image=image, gpu="A100", timeout=5400)
+@app.function(image=image, gpu="A100", cpu=8.0, memory=32768, timeout=5400)
 def bench_a100():
     return run_on_device("A100-40GB")
 
 
-@app.function(image=image, gpu="H100", timeout=5400)
+@app.function(image=image, gpu="H100", cpu=8.0, memory=32768, timeout=5400)
 def bench_h100():
     return run_on_device("H100")
 
 
-@app.function(image=image, gpu="L40S", timeout=5400)
+@app.function(image=image, gpu="L40S", cpu=8.0, memory=32768, timeout=5400)
 def bench_l40s():
     return run_on_device("L40S")
 
@@ -215,8 +244,9 @@ def main(gpus: str = "A100,H100,L40S"):
         print("=" * 72)
         print(f"{r['gpu']}: {d['name']}  cc {d['compute_cap']}  {d['memory']}")
         print(
-            f"  PCIe: gen {d['pcie_gen_now']} x{d['pcie_width_now']} "
-            f"(max gen {d['pcie_gen_max']} x{d['pcie_width_max']})"
+            f"  PCIe idle: gen {d['pcie_gen_now']} x{d['pcie_width_now']} | "
+            f"under load: {r.get('pcie_under_load', '?')} | "
+            f"max: gen {d['pcie_gen_max']} x{d['pcie_width_max']}"
         )
         print(f"  host: {r['cpu_cores']} cores, {r['jq_version']}")
         status = "FAILED" if r["tests_failed"] else "passed"
