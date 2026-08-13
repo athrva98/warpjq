@@ -4,3 +4,4 @@
 /fuzz/corpus
 /fuzz/artifacts
 *.ndjson
+/modal_results.json

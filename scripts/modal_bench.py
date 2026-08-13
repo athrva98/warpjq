@@ -20,7 +20,7 @@ import subprocess
 import modal
 
 # Pin the commit so a re-run measures the same code.
-COMMIT = "8e13ea2fc1af95e8cbe2214605484decef3c95c6"
+COMMIT = "337d28d03cc6ef291959bb8a8c27f8ccee405daf"
 REPO = "https://github.com/athrva98/warpjq"
 
 # sm_80 A100, sm_89 L40S and Ada, sm_90 H100/H200.
