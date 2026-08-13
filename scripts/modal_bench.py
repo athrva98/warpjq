@@ -262,3 +262,55 @@ def main(gpus: str = "A100,H100,L40S"):
         for k, v in r["crossover"].items():
             print(f"    {k:<20} {v}")
     print("\nwrote modal_results.json")
+
+
+@app.function(image=image, gpu="H100", cpu=8.0, memory=65536, timeout=5400)
+def scaling():
+    """Find the size where the CUDA path overtakes the CPU engine, if it does.
+
+    At 1 GB the GPU loses on every device tested. The per-stage profile says
+    the kernels are fast and the fixed CUDA setup is roughly 0.2 s, which
+    predicts a crossover somewhere above 1 GB. Measure it rather than
+    extrapolate from two points.
+    """
+    W = "./target/release/warpjq"
+    out = {"device": device_facts(), "sizes": {}}
+
+    for size in ("2GB", "4GB", "8GB"):
+        sh(f"{W} gen --preset nginx --size {size} -o /tmp/scale.ndjson --seed 1")
+        sh("cat /tmp/scale.ndjson > /dev/null")
+        row = {}
+        for backend in ("gpu", "cpu"):
+            best = None
+            for _ in range(3):
+                t = sh(
+                    f"{W} 'select(.status == 500) | count' "
+                    f"--backend {backend} --stats /tmp/scale.ndjson > /dev/null"
+                )
+                for line in t.splitlines():
+                    if " in " in line and "GB/s" in line:
+                        secs = float(line.split(" in ")[1].split("s ")[0])
+                        best = secs if best is None else min(best, secs)
+            row[backend] = best
+        row["profile"] = sh(
+            f"WARPJQ_PROFILE=1 {W} 'select(.status == 500) | count' "
+            "--backend gpu /tmp/scale.ndjson > /dev/null"
+        )
+        out["sizes"][size] = row
+        print(f"[scaling] {size}: gpu={row['gpu']} cpu={row['cpu']}", flush=True)
+        sh("rm -f /tmp/scale.ndjson")
+
+    return out
+
+
+@app.local_entrypoint()
+def scale():
+    r = scaling.remote()
+    print(f"device: {r['device']['name']}")
+    for size, row in r["sizes"].items():
+        speedup = row["cpu"] / row["gpu"] if row["gpu"] else 0
+        print(f"  {size:<5} gpu={row['gpu']:<7} cpu={row['cpu']:<7} "
+              f"gpu is {speedup:.2f}x the cpu")
+        for line in row["profile"].splitlines():
+            if "profile:" in line:
+                print("      ", line.strip())

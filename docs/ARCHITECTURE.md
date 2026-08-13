@@ -328,17 +328,45 @@ total wall               0.522s     2.06 GB/s
 ```
 
 The kernels do the actual work (validate every byte of every line, resolve
-paths, evaluate predicates, hash and aggregate) at **20 GB/s**. The CPU engine
-does the same work at ~2.8 GB/s. The gap between 20 GB/s of capability and
-2.06 GB/s of delivered throughput is entirely host-side: a ~7 GB/s copy into
-pinned memory, plus ~0.15 s of one-time CUDA context and allocation cost.
+paths, evaluate predicates, hash and aggregate) at 20 GB/s on this part. The
+CPU engine does the same work at ~2.8 GB/s. The gap between that capability and
+2.06 GB/s of delivered throughput is host-side: a ~7 GB/s copy into pinned
+memory, plus ~0.2 s of one-time CUDA context and allocation cost.
 
-The consequence, stated plainly because it is the most useful thing this
-document contains: **on this class of machine warpjq is input-bound, not
-compute-bound.** Optimising the kernels further would change nothing. The three
-things that would move the number are all in the input path, and they are the
-top three items on the roadmap.
+**warpjq is input-bound, not compute-bound.** Optimising the kernels further
+would change nothing.
 
-A desktop with PCIe Gen4 x16 and quad-channel memory would feed the GPU
-considerably faster; that measurement has not been taken and no claim is made
-about it here.
+### The same measurement on datacentre parts
+
+An earlier version of this section attributed the result to the laptop's narrow
+PCIe link and predicted that a card with a full x16 link would change it. That
+prediction was tested on an L40S, an A100 SXM4 40 GB and an H100 80 GB HBM3,
+with the link sampled while transfers were in flight rather than at idle. It
+was wrong. All three are gen 4 or gen 5 x16 under load, and at 1 GB the CPU
+engine still wins on every one of them.
+
+What the larger runs show instead, on an H100 with 8 host cores:
+
+| stage | 2 GB | 4 GB | 8 GB |
+|---|---|---|---|
+| copy to pinned | 0.463 s | 0.981 s | 1.995 s |
+| submit (H2D and kernels) | 0.051 s | 0.102 s | 0.203 s |
+| total wall | 0.845 s | 1.417 s | 2.719 s |
+
+The kernels sustain **42.2 GB/s at every size**. The host copy runs at 4.3 GB/s
+and is 73% of the 8 GB run. PCIe was never the constraint; the copy from the
+mapping into the pinned staging buffer is, and it is the first roadmap item.
+
+Two further findings from that sweep:
+
+* **Kernel throughput does not track device tier.** An RTX 5060 Laptop part
+  (20.2 GB/s at 1 GB) beats both an A100 (11.9) and an L40S (14.3). The kernel
+  is one thread per line walking bytes: scalar, branch-heavy integer work that
+  is latency and clock bound, so HBM and a high SM count buy it nothing. This
+  is worth remembering before optimising for a device that looks impressive on
+  paper.
+* **The crossover is between 1 GB and 2 GB.** Below it the CPU engine wins, by
+  36x at 1 MB, because CUDA context creation costs ~0.2 s whatever the input
+  size. Above it the GPU wins, reaching 2.0x at 8 GB.
+
+Full matrix in [BENCHMARKS.md](BENCHMARKS.md).

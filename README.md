@@ -46,39 +46,76 @@ warpjq bench 'select(.status == 500) | count' access.ndjson
 output, and refuses to report a time for any tool whose answer disagrees with
 warpjq's.
 
-### Reading these numbers
+### GPU against CPU, by input size
 
-The two warpjq columns are within measurement noise of each other. Repeating an
-identical run five times on the RTX 5060 gives the GPU a 0.31 s to 0.45 s
-spread while the CPU stays within 0.006 s.
+The CUDA path is worth using above roughly 1.5 GB and not below it.
+`select(.status == 500) | count`, best of three, H100 80 GB HBM3 with 8 host
+cores:
 
-The speedup over jq comes from the query compiler, the byte-slice value model
-and multi-core execution. On the RTX 5060, the CUDA path does not improve on
-the CPU engine at these sizes, and below roughly 200 MB it loses: a 1 MB file
-takes 0.001 s on CPU and 0.044 s on GPU, which is CUDA context setup.
+| input | warpjq (gpu) | warpjq (cpu) | gpu / cpu |
+|---|---|---|---|
+| 1 MB | 0.217 s | 0.006 s | 0.03x |
+| 200 MB | 0.223 s | 0.061 s | 0.27x |
+| 1 GB | 0.286 s | 0.254 s | 0.89x |
+| 2 GB | 0.845 s | 1.180 s | 1.40x |
+| 4 GB | 1.417 s | 2.455 s | 1.73x |
+| 8 GB | 2.719 s | 5.451 s | 2.00x |
 
-Both figures depend on the machine. A desktop with PCIe Gen4 x16 and more
-memory channels would feed the GPU faster than an 8 GB laptop part on a shared
-bus. That measurement has not been taken, and no claim is made about it.
+CUDA context creation costs about 0.2 s whatever the input size, which is the
+entire 1 MB figure. Past the crossover the GPU pipeline runs at roughly 3 GB/s
+end-to-end against the CPU engine's 1.6 GB/s.
 
-### Per-stage timings
+`--backend auto` uses whichever backend is available and does not yet pick by
+file size. On inputs below a gigabyte, `--backend cpu` is faster.
 
-`WARPJQ_PROFILE=1` breaks a single GPU run into stages:
+**The speedup over jq is not the GPU's doing.** Both warpjq backends are two
+orders of magnitude above jq, so the 100x comes from the query compiler, the
+byte-slice value model and multi-core execution. The CUDA path adds a further
+2x on large inputs.
+
+### Verified on four architectures
+
+The full suite, 224 tests including the differential comparison against jq,
+passes on sm_80, sm_89, sm_90 and sm_120.
+
+| device | cc | PCIe under load | kernels | host copy |
+|---|---|---|---|---|
+| RTX 5060 Laptop | 12.0 | gen 4 x8 | 20.2 GB/s | 7.0 GB/s |
+| L40S | 8.9 | gen 4 x16 | 14.3 GB/s | 19.9 GB/s |
+| A100 SXM4 40 GB | 8.0 | gen 4 x16 | 11.9 GB/s | 9.7 GB/s |
+| H100 80 GB HBM3 | 9.0 | gen 5 x16 | 29.4 GB/s | 21.8 GB/s |
+
+Kernel throughput does not track device tier. A laptop part beats both an A100
+and an L40S. The kernel is one thread per line walking a byte at a time:
+scalar, branch-heavy integer work that is latency and clock bound rather than
+bandwidth bound, so HBM buys it nothing.
+
+### Where the time goes
+
+`WARPJQ_PROFILE=1` breaks a run into stages. H100, 8 GB:
 
 ```
-$ WARPJQ_PROFILE=1 warpjq 'group_by(.host) | count' --backend gpu access.ndjson
-warpjq profile: 1.07 GB through the pipeline
-warpjq profile: read+chunk (host)        0.000s  8055.08 GB/s
-warpjq profile: copy to pinned           0.154s     6.99 GB/s
-warpjq profile: submit (H2D+kernels)     0.053s    20.18 GB/s
-warpjq profile: wait (sync+D2H)          0.033s    32.45 GB/s
-warpjq profile: merge+write              0.000s 11582.98 GB/s
+warpjq profile: 8.59 GB through the pipeline
+warpjq profile: read+chunk (host)        0.027s   322.65 GB/s
+warpjq profile: copy to pinned           1.995s     4.31 GB/s
+warpjq profile: submit (H2D+kernels)     0.203s    42.22 GB/s
+warpjq profile: wait (sync+D2H)          0.001s 15887.49 GB/s
+warpjq profile: merge+write              0.000s 66702.91 GB/s
 ```
 
-The kernels parse, filter and aggregate at 20 GB/s. The host copies into pinned
-memory at 7 GB/s, and CUDA context setup costs a fixed 0.15 s. The input path,
-not the kernels, sets the end-to-end rate on an RTX 5060 Laptop. The
-[roadmap](#roadmap) lists what would change that.
+The kernels sustain 42 GB/s. The host copy into pinned memory runs at 4.3 GB/s
+and is 73% of the run: the GPU spends 0.203 s on the work and the host spends
+1.995 s handing it the bytes. Removing that copy, by reading straight into the
+staging buffer, would put the 8 GB run near 0.72 s, or 7.5x the CPU engine
+rather than 2.0x. That is the first item on the [roadmap](#roadmap).
+
+An earlier version of this README blamed a laptop's narrow PCIe link and
+predicted a datacentre card would change the picture. Three cards with gen 4
+and gen 5 x16 links, verified under load, did not. PCIe was not the
+constraint.
+
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) has the full matrix, the per-device
+query breakdown, and instructions for reproducing the datacentre runs.
 
 ---
 
@@ -332,11 +369,11 @@ lone low surrogate (`"\ude00"`) is accepted by both.
 
 ## Limitations
 
-- **The CUDA path does not beat the CPU engine end to end on an RTX 5060
-  Laptop.** The kernels run 7x faster, but the host feed rate of 7 GB/s and the
-  0.15 s CUDA setup dominate. Below roughly 200 MB the CPU engine wins.
-  `--backend auto` uses whichever is available and does not yet pick by file
-  size.
+- **The CUDA path only wins above roughly 1.5 GB.** CUDA context creation
+  costs about 0.2 s regardless of input size, and the host copy into pinned
+  memory runs at 4.3 GB/s against the kernels' 42 GB/s. Below the crossover
+  the CPU engine wins, by 36x at 1 MB. `--backend auto` uses whichever backend
+  is available and does not yet pick by file size.
 - **Rendering differs from jq** for `\uXXXX` escapes, `\/` and exponent-form
   numbers. See [Differences from jq](#differences-from-jq).
 - **NDJSON only.** One JSON value per line. A single multi-gigabyte JSON
@@ -360,15 +397,17 @@ lone low surrogate (`"\ude00"`) is accepted by both.
 
 Ordered by measured impact on the profile above.
 
-- [ ] Read directly into pinned memory. The 7 GB/s host copy is the bottleneck;
-      a `read()` into the staging buffer removes both the copy and the mmap
-      fault storm.
+- [ ] Read directly into pinned memory. The host copy is 73% of an 8 GB run on
+      an H100, at 4.3 GB/s against the kernels' 42 GB/s. A `read()` into the
+      staging buffer removes both the copy and the mmap fault storm, and would
+      take that run from 2.0x the CPU engine to roughly 7.5x.
 - [ ] Remove the mid-submit stream sync. `warpjq_submit` blocks to read the
       newline count; passing it device-side lets chunk *n+1*'s copy overlap
       chunk *n*'s kernels.
-- [ ] Cut the 0.15 s CUDA setup, which accounts for most of the small-file loss.
-- [ ] Backend selection by file size, once the crossover is measured on more
-      than one machine.
+- [ ] Cut the 0.2 s CUDA setup, which is the entire cost of a 1 MB run and
+      sets where the crossover lands.
+- [ ] Backend selection by file size. The crossover is measured at 1 GB to
+      2 GB on four devices, so `auto` has the numbers it needs to choose.
 - [ ] Warp-cooperative structural scan, once the input path stops being the
       limit.
 - [ ] gzip input, with GPU decompression before parsing.
