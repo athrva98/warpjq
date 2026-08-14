@@ -612,10 +612,8 @@ fn run_jq(jq: &str, args: &[&str], expr: &str, data: &[u8]) -> Option<String> {
     // makes a green suite mean very little.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "warpjq-jq-input-{}-{n}.ndjson",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("warpjq-jq-input-{}-{n}.ndjson", std::process::id()));
     std::fs::write(&path, data).ok()?;
     let out = Command::new(jq)
         .args(args)

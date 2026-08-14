@@ -291,7 +291,9 @@ impl Backend for GpuBackend {
 
                 loop {
                     let t = std::time::Instant::now();
-                    let Ok((out, done)) = res_rx.recv() else { break };
+                    let Ok((out, done)) = res_rx.recv() else {
+                        break;
+                    };
                     // What is left here is the part of the read that could not
                     // be hidden behind device work. It should be near zero
                     // once the reader is a chunk ahead.
@@ -413,7 +415,6 @@ impl Backend for GpuBackend {
                     }
                 }
             }
-
 
             prof.report();
             if let Some(e) = abort {

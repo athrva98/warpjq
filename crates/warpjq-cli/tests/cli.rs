@@ -693,7 +693,11 @@ mod pinned_reader {
             return;
         }
         assert_eq!(gpu.code, cpu.code, "exit codes differ, gpu: {}", gpu.stderr);
-        assert_eq!(gpu.stdout, cpu.stdout, "output differs\ngpu stderr: {}", gpu.stderr);
+        assert_eq!(
+            gpu.stdout, cpu.stdout,
+            "output differs\ngpu stderr: {}",
+            gpu.stderr
+        );
     }
 
     #[test]
@@ -713,9 +717,30 @@ mod pinned_reader {
             data.push_str(&format!("{{\"a\":{},\"tag\":\"after\"}}\n", i % 5));
         }
         let f = s.write("long.ndjson", &data);
-        gpu_and_cpu_agree(&["--chunk-size", "1MB", "--max-line-bytes", "8MB", "count"], &p(&f));
-        gpu_and_cpu_agree(&["--chunk-size", "1MB", "--max-line-bytes", "8MB", "select(.a == 2) | count"], &p(&f));
-        gpu_and_cpu_agree(&["--chunk-size", "1MB", "--max-line-bytes", "8MB", "group_by(.tag) | count"], &p(&f));
+        gpu_and_cpu_agree(
+            &["--chunk-size", "1MB", "--max-line-bytes", "8MB", "count"],
+            &p(&f),
+        );
+        gpu_and_cpu_agree(
+            &[
+                "--chunk-size",
+                "1MB",
+                "--max-line-bytes",
+                "8MB",
+                "select(.a == 2) | count",
+            ],
+            &p(&f),
+        );
+        gpu_and_cpu_agree(
+            &[
+                "--chunk-size",
+                "1MB",
+                "--max-line-bytes",
+                "8MB",
+                "group_by(.tag) | count",
+            ],
+            &p(&f),
+        );
     }
 
     #[test]
@@ -723,8 +748,16 @@ mod pinned_reader {
         let s = Scratch::new("longline-err");
         let big = "x".repeat(2 << 20);
         let f = s.write("over.ndjson", &format!("{{\"a\":\"{big}\"}}\n"));
-        let out = run(&["--backend", "gpu", "--chunk-size", "1MB",
-                        "--max-line-bytes", "1MB", ".a", &p(&f)]);
+        let out = run(&[
+            "--backend",
+            "gpu",
+            "--chunk-size",
+            "1MB",
+            "--max-line-bytes",
+            "1MB",
+            ".a",
+            &p(&f),
+        ]);
         if no_gpu(&out.stderr) {
             eprintln!("cli: SKIPPING, no GPU");
             return;
@@ -742,13 +775,21 @@ mod pinned_reader {
         for i in 0..120_000 {
             data.push_str(&format!(
                 "{{\"status\":{},\"host\":\"h{}\",\"bytes\":{}}}\n",
-                if i % 7 == 0 { 500 } else { 200 }, i % 4, i * 3
+                if i % 7 == 0 { 500 } else { 200 },
+                i % 4,
+                i * 3
             ));
         }
         let f = s.write("multi.ndjson", &data);
         for cs in ["64KB", "256KB", "1MB"] {
-            gpu_and_cpu_agree(&["--chunk-size", cs, "select(.status == 500) | count"], &p(&f));
-            gpu_and_cpu_agree(&["--chunk-size", cs, "group_by(.host) | sum(.bytes)"], &p(&f));
+            gpu_and_cpu_agree(
+                &["--chunk-size", cs, "select(.status == 500) | count"],
+                &p(&f),
+            );
+            gpu_and_cpu_agree(
+                &["--chunk-size", cs, "group_by(.host) | sum(.bytes)"],
+                &p(&f),
+            );
             gpu_and_cpu_agree(&["--chunk-size", cs, "select(.status == 500)"], &p(&f));
         }
     }

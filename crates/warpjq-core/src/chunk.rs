@@ -37,11 +37,7 @@ pub enum Input {
     /// pinned pool, which needs positional reads. The mapping stays for the
     /// CPU backend, and for the one case the pinned reader cannot serve, a
     /// single line longer than a whole chunk.
-    Mapped {
-        map: Mmap,
-        file: File,
-        name: String,
-    },
+    Mapped { map: Mmap, file: File, name: String },
     /// stdin or anything else non-seekable, read into a growable buffer.
     Streamed {
         reader: Box<dyn Read + Send>,
