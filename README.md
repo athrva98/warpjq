@@ -78,13 +78,29 @@ On 1 GB of nginx-style logs, warpjq runs a filter-and-count in 0.25 s against
 30.5 s for jq 1.8.2. Both backends are well over two orders of magnitude
 faster than jq, so the margin does not depend on having a GPU.
 
-The CUDA backend overtakes the CPU one above roughly 1.5 GB, reaching 2x at
-8 GB. Below that the CPU backend is faster, by a wide margin on small inputs,
-because CUDA context creation costs about 0.2 s regardless of input size.
-`--backend auto` does not yet choose by size.
+Against DuckDB's `read_ndjson`, which is the closer comparison, on 8 GB of the
+same data on an H100:
 
-`warpjq bench <query> <file>` reproduces these against whatever jq you have
-installed. Full tables, per-device figures and the profile breakdown are in
+| | warpjq | duckdb 1.5.5 | |
+|---|---|---|---|
+| `select(.status == 500) \| count` | 0.520 s | 0.927 s | 1.78x |
+| `select(.status >= 500) \| {p: .path, b: .bytes}` | 0.737 s | 1.172 s | 1.59x |
+| `group_by(.host) \| count` | 0.491 s | 0.988 s | 2.01x |
+| `select(.status == 500)` | 0.731 s | 1.916 s | 2.62x |
+
+At 1 GB DuckDB wins the same filter-and-count, 0.30 s against 0.32 s, because
+CUDA context creation costs about 0.2 s whatever the input size. The crossover
+was not measured and is somewhere between. DuckDB also answers a far wider
+range of questions than this subset of jq does; the comparison is one query
+shape on one file, not a general claim.
+
+The CUDA backend overtakes warpjq's own CPU backend above roughly 1.5 GB.
+Below that the CPU backend is faster, by a wide margin on small inputs, for
+the same reason. `--backend auto` does not yet choose by size.
+
+`warpjq bench <query> <file>` reproduces the jq numbers against whatever jq
+you have installed; `scripts/modal_zerocopy.py` reproduces the DuckDB ones.
+Full tables, per-device figures and the profile breakdown are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Compatibility with jq

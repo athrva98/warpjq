@@ -215,7 +215,7 @@ pub fn run_query<W: Write>(
                 // table holds, or not enough device memory) can still fall
                 // back on `auto` instead of failing the whole run. Nothing has
                 // been written at this point, so falling back is safe.
-                match crate::gpu::GpuBackend::prepared(program, options) {
+                match crate::gpu::GpuBackend::prepared(program, options, input.len_hint()) {
                     Ok(mut backend) => return backend.run(program, input, options, writer),
                     Err(e) if preference == Preference::Gpu => return Err(e),
                     Err(e) => {

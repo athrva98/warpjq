@@ -17,12 +17,39 @@ use crate::query::Program;
 
 pub use lower::LoweredProgram;
 
-/// Three, not two, because three things are happening at once on the file
-/// path: one slot is being filled by the reader thread, one is on the device,
-/// and one is being drained. Two slots were enough only while the read and the
-/// submit ran back to back on the same thread, which is exactly the
-/// serialisation the reader thread removes.
-const N_SLOTS: u32 = 3;
+/// Enough to keep one slot on the device and one being drained. Anything that
+/// does not read ahead needs no more than this.
+const MIN_SLOTS: u32 = 2;
+
+/// A third slot lets the reader run a chunk ahead: one filling, one on the
+/// device, one draining. Two cannot do it, because the slot the reader would
+/// fill is the one still in flight.
+const PREFETCH_SLOTS: u32 = 3;
+
+/// Reading ahead is worth a third slot only on a long enough input.
+///
+/// The slot is not free: `alloc_all` pins another `chunk_cap` of host memory
+/// and its result buffers at context creation. What it buys is the exposed
+/// read, which at 8 GB fell from 0.268 s to 0.045 s. So the cost scales with
+/// the chunk size and the benefit with the total, which makes the crossover a
+/// number of chunks rather than a number of bytes: at the default 64 MB chunk
+/// the fixed cost measured about 0.08 s against reads running near 19 GB/s,
+/// putting break-even around 27 chunks.
+///
+/// The threshold is set above that rather than at it. Being wrong in this
+/// direction costs a little speed on a mid-sized input; being wrong in the
+/// other direction is the 1 GB regression this exists to avoid, where three
+/// slots ran a projection in 0.516 s against two at 0.432 s.
+///
+/// Streams get two. Their length is unknown, and they take the chunker path,
+/// which does not read ahead in any case.
+fn slots_for(len: Option<u64>, chunk_cap: usize) -> u32 {
+    const PREFETCH_MIN_CHUNKS: u64 = 32;
+    match len {
+        Some(n) if n > chunk_cap as u64 * PREFETCH_MIN_CHUNKS => PREFETCH_SLOTS,
+        _ => MIN_SLOTS,
+    }
+}
 
 /// GPU chunks are smaller than the CPU default. The index arrays are sized off
 /// this, and smaller chunks also overlap better, since there is nothing to hide
@@ -69,6 +96,7 @@ pub struct GpuBackend {
     /// Kept alive because the device program holds pointers into it.
     _lowered: Option<Box<LoweredProgram>>,
     chunk_cap: usize,
+    n_slots: u32,
 }
 
 // The context is only ever touched from the thread that created it; the
@@ -82,6 +110,7 @@ impl GpuBackend {
             ctx: std::ptr::null_mut(),
             _lowered: None,
             chunk_cap: 0,
+            n_slots: MIN_SLOTS,
         })
     }
 
@@ -91,13 +120,22 @@ impl GpuBackend {
     /// the kernel's slot table, or where device allocation fails. Doing it up
     /// front lets the caller fall back to the CPU while no output has been
     /// written yet.
-    pub fn prepared(program: &Program, options: &Options) -> Result<GpuBackend> {
+    pub fn prepared(
+        program: &Program,
+        options: &Options,
+        input_len: Option<u64>,
+    ) -> Result<GpuBackend> {
         let mut b = GpuBackend::new()?;
-        b.ensure_ctx(program, options)?;
+        b.ensure_ctx(program, options, input_len)?;
         Ok(b)
     }
 
-    fn ensure_ctx(&mut self, program: &Program, options: &Options) -> Result<()> {
+    fn ensure_ctx(
+        &mut self,
+        program: &Program,
+        options: &Options,
+        input_len: Option<u64>,
+    ) -> Result<()> {
         if !self.ctx.is_null() {
             return Ok(());
         }
@@ -105,13 +143,14 @@ impl GpuBackend {
         let cap = options
             .chunk_bytes
             .min(DEFAULT_GPU_CHUNK_BYTES.max(1 << 20));
+        let n_slots = slots_for(input_len, cap);
         let mut ctx: *mut ffi::Ctx = std::ptr::null_mut();
         let mut err = ffi::ErrBuf::new();
         let rc = unsafe {
             ffi::warpjq_ctx_create(
                 &lowered.ffi_program(),
                 cap as u64,
-                N_SLOTS,
+                n_slots,
                 &mut ctx,
                 err.as_mut_ptr(),
                 err.len(),
@@ -125,6 +164,7 @@ impl GpuBackend {
         }
         self.ctx = ctx;
         self.chunk_cap = cap;
+        self.n_slots = n_slots;
         self._lowered = Some(lowered);
         Ok(())
     }
@@ -208,7 +248,7 @@ impl Backend for GpuBackend {
         options: &Options,
         writer: &mut Writer<W>,
     ) -> Result<RunStats> {
-        self.ensure_ctx(program, options)?;
+        self.ensure_ctx(program, options, input.len_hint())?;
 
         let plan = crate::exec::cpu::Plan::new(program);
         let mut stats = RunStats {
@@ -228,6 +268,7 @@ impl Backend for GpuBackend {
 
         let ctx = self.ctx;
         let cap = self.chunk_cap;
+        let n_slots = self.n_slots;
         let mut last_return = std::time::Instant::now();
 
         let drain = |f: &InFlight,
@@ -249,13 +290,16 @@ impl Backend for GpuBackend {
         if let Some((file, len)) = input.file() {
             // Resolved before the reader starts, so no device pointer has to
             // cross a thread boundary.
-            let bufs: Vec<usize> = (0..N_SLOTS)
+            let bufs: Vec<usize> = (0..n_slots)
                 .map(|s| unsafe { ffi::warpjq_slot_buffer(ctx, s) } as usize)
                 .collect();
-            if bufs.iter().any(|&b| b == 0) {
+            if bufs.contains(&0) {
                 return Err(WarpError::other("device staging buffer is unavailable"));
             }
             let max_line = options.max_line_bytes;
+            // Reading ahead needs a slot that is neither in flight nor being
+            // drained, so it is available only when a third was allocated.
+            let prefetch = n_slots >= PREFETCH_SLOTS;
 
             std::thread::scope(|scope| {
                 let (req_tx, req_rx) = std::sync::mpsc::channel::<u32>();
@@ -310,12 +354,15 @@ impl Backend for GpuBackend {
                             // Ask for the next chunk before submitting this
                             // one. That ordering is the entire point: the read
                             // then runs while this thread is blocked in the
-                            // driver. The slot is free because with three of
-                            // them the next one last held chunk n-2, drained
-                            // on the previous iteration.
-                            if !done {
+                            // driver. It is only sound with a third slot,
+                            // because the one the reader would fill last held
+                            // chunk n-2, drained on the previous iteration.
+                            // With two, that slot is the one about to go on the
+                            // device, so the request waits until after the
+                            // drain below.
+                            if !done && prefetch {
                                 chunk_no += 1;
-                                cur = (chunk_no % N_SLOTS as u64) as u32;
+                                cur = (chunk_no % n_slots as u64) as u32;
                                 if req_tx.send(cur).is_err() {
                                     abort = Some(WarpError::other("the input reader stopped"));
                                     break;
@@ -347,6 +394,17 @@ impl Backend for GpuBackend {
                             in_flight = Some(queued);
                             if done {
                                 break;
+                            }
+                            // Two slots: the drain above has just freed the one
+                            // the reader needs, so the request goes out now
+                            // rather than before the submit.
+                            if !prefetch {
+                                chunk_no += 1;
+                                cur = (chunk_no % n_slots as u64) as u32;
+                                if req_tx.send(cur).is_err() {
+                                    abort = Some(WarpError::other("the input reader stopped"));
+                                    break;
+                                }
                             }
                         }
                         ReadOut::LongLine(bytes) => {
@@ -391,7 +449,7 @@ impl Backend for GpuBackend {
                                 break;
                             }
                             chunk_no += 1;
-                            cur = (chunk_no % N_SLOTS as u64) as u32;
+                            cur = (chunk_no % n_slots as u64) as u32;
                             if req_tx.send(cur).is_err() {
                                 abort = Some(WarpError::other("the input reader stopped"));
                                 break;
@@ -471,7 +529,7 @@ impl Backend for GpuBackend {
                 return Ok(0);
             }
 
-            let slot = (chunk_no % N_SLOTS as u64) as u32;
+            let slot = (chunk_no % n_slots as u64) as u32;
             // Safe because the slot we are about to reuse was drained on the
             // previous iteration: with two slots, chunk n and chunk n-2 share
             // a slot and chunk n-2 was waited on while chunk n-1 was queued.
@@ -1124,4 +1182,42 @@ fn run_chunk_on_cpu<W: Write>(
     let (bytes, rows) = out.into_inner()?;
     writer.write_raw(&bytes, rows)?;
     Ok(lines)
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    const CAP: usize = 64 << 20;
+
+    #[test]
+    fn small_inputs_do_not_pay_for_a_third_slot() {
+        // The 1 GB regression this sizing exists to avoid.
+        assert_eq!(slots_for(Some(1 << 30), CAP), MIN_SLOTS);
+        assert_eq!(slots_for(Some(0), CAP), MIN_SLOTS);
+        assert_eq!(slots_for(Some(CAP as u64), CAP), MIN_SLOTS);
+    }
+
+    #[test]
+    fn large_inputs_read_ahead() {
+        assert_eq!(slots_for(Some(8 << 30), CAP), PREFETCH_SLOTS);
+    }
+
+    #[test]
+    fn a_stream_of_unknown_length_never_reads_ahead() {
+        // It cannot: an unknown length could be one chunk, and the chunker
+        // path it takes does not prefetch regardless.
+        assert_eq!(slots_for(None, CAP), MIN_SLOTS);
+    }
+
+    #[test]
+    fn the_threshold_follows_the_chunk_size() {
+        // The cost is one slot's buffers and the benefit is total read time,
+        // so the crossover is a chunk count. A smaller chunk must reach it on
+        // a proportionally smaller file, which is also what lets a test drive
+        // the prefetch path without a multi-gigabyte fixture.
+        let small = 1 << 20;
+        assert_eq!(slots_for(Some(40 << 20), small), PREFETCH_SLOTS);
+        assert_eq!(slots_for(Some(40 << 20), CAP), MIN_SLOTS);
+    }
 }

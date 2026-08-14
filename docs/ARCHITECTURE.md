@@ -181,18 +181,29 @@ less than storing `n_paths x 12 bytes x every line in the chunk`.
 
 ## Where the time goes
 
-H100, `select(.status == 500) | count`:
+H100, 8 GB, `select(.status == 500) | count`, across the three input paths the
+backend has had:
 
-| stage | 2 GB | 4 GB | 8 GB |
+| stage | mmap + copy | pinned reads | + reader thread |
 |---|---|---|---|
-| read and chunk | 0.004 s | 0.015 s | 0.027 s |
-| copy to pinned | 0.463 s | 0.981 s | 1.995 s |
-| submit (H2D and kernels) | 0.051 s | 0.102 s | 0.203 s |
-| wait, merge, write | 0.000 s | 0.000 s | 0.001 s |
-| total | 0.845 s | 1.417 s | 2.719 s |
+| read | 0.083 s | 0.427 s | 0.045 s |
+| copy to pinned | 2.165 s | none | none |
+| submit (H2D and kernels) | 0.185 s | 0.242 s | 0.224 s |
+| wait, merge, write | 0.000 s | 0.000 s | 0.000 s |
+| total | 2.507 s | 0.995 s | 0.520 s |
 
-Kernels sustain 42.2 GB/s at every size. The host copy runs at 4.3 GB/s and is
-73% of the 8 GB run.
+The first column mapped the file and memcpy'd each chunk into the pinned
+buffer the DMA engine reads from, which cost more than the transfer and the
+kernels together. The second reads the file straight into those buffers, so
+the bytes land once. The third fills the next buffer on a separate thread
+while the device works, which is why `read` drops without the work getting
+smaller: what is left is only the part that could not be hidden.
+
+Each column is an A/B against the one before it, on one machine with one file.
+Absolute figures move between containers, sometimes by 35%, so the ratios are
+the part worth quoting. Registering the mapping with `cudaHostRegister`
+instead of copying was also tried and is 2x slower: pinning 8 GB of pages runs
+at 5.3 GB/s against 20.8 GB/s for the memcpy it would replace.
 
 Kernel throughput does not track device tier: RTX 5060 Laptop 20.2 GB/s, L40S
 14.3, A100 11.9, H100 29.4 (all at 1 GB). The kernel is latency and clock
@@ -221,9 +232,11 @@ RTX 5060 Laptop (sm_120), Windows 11, against jq 1.8.2:
 memory as parsed JSON.
 
 GPU against CPU by input size, `select(.status == 500) | count`, H100 80 GB
-with 8 host cores:
+with 8 host cores. **The GPU column predates the input path rewrite** and is
+kept for the shape of the curve, not the values: 8 GB now runs in 0.520 s
+rather than 2.719 s. The sizes between have not been remeasured.
 
-| input | gpu | cpu | ratio |
+| input | gpu (old path) | cpu | ratio |
 |---|---|---|---|
 | 1 MB | 0.217 s | 0.006 s | 0.03x |
 | 200 MB | 0.223 s | 0.061 s | 0.27x |
@@ -231,6 +244,23 @@ with 8 host cores:
 | 2 GB | 0.845 s | 1.180 s | 1.40x |
 | 4 GB | 1.417 s | 2.455 s | 1.73x |
 | 8 GB | 2.719 s | 5.451 s | 2.00x |
+
+Against DuckDB 1.5.5 `read_ndjson_auto`, H100, 8 host cores, 8 GB, each timed
+in a fresh process so neither side reuses a parse:
+
+| query | warpjq | duckdb |
+|---|---|---|
+| `select(.status == 500) \| count` | 0.520 s | 0.927 s |
+| `select(.status >= 500) \| {p: .path, b: .bytes}` | 0.737 s | 1.172 s |
+| `group_by(.host) \| count` | 0.491 s | 0.988 s |
+| `select(.status == 500)` | 0.731 s | 1.916 s |
+
+At 1 GB DuckDB wins the same filter-and-count, 0.297 s against 0.316 s. The
+crossover was not measured; it is somewhere between 1 and 8 GB. Answers were
+compared before either side was timed, and agreed exactly on every query.
+DuckDB is doing schema inference here, which is what a user typing
+`read_ndjson_auto` actually pays, but it does mean this is not a pure scan
+comparison.
 
 Per-device, same 1 GB file, 8 host cores, PCIe sampled under load:
 

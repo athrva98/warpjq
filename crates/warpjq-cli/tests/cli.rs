@@ -795,6 +795,42 @@ mod pinned_reader {
     }
 
     #[test]
+    fn reading_ahead_agrees_with_the_cpu() {
+        // Past 32 chunks the backend allocates a third slot and the reader
+        // runs a chunk ahead of the device. At the default chunk size that
+        // needs a 2 GB fixture; a small chunk reaches the same code path on a
+        // file a test can write. Without this the prefetch protocol, which is
+        // where a slot could be refilled while still in flight, is only ever
+        // exercised by hand.
+        let s = Scratch::new("prefetch");
+        let mut data = String::new();
+        for i in 0..400_000 {
+            data.push_str(&format!(
+                "{{\"status\":{},\"host\":\"h{}\",\"bytes\":{}}}
+",
+                if i % 9 == 0 { 500 } else { 200 },
+                i % 6,
+                i * 7
+            ));
+        }
+        let f = s.write("pf.ndjson", &data);
+        // ~16 MB over 1 MB chunks is ~16 chunks: two slots, no read ahead.
+        // Over 256 KB it is ~64 chunks: three slots, reading ahead.
+        for cs in ["1MB", "256KB", "128KB"] {
+            gpu_and_cpu_agree(&["--chunk-size", cs, "count"], &p(&f));
+            gpu_and_cpu_agree(
+                &["--chunk-size", cs, "select(.status == 500) | count"],
+                &p(&f),
+            );
+            gpu_and_cpu_agree(
+                &["--chunk-size", cs, "group_by(.host) | sum(.bytes)"],
+                &p(&f),
+            );
+            gpu_and_cpu_agree(&["--chunk-size", cs, "select(.status == 500)"], &p(&f));
+        }
+    }
+
+    #[test]
     fn a_file_with_no_trailing_newline_keeps_its_last_line() {
         let s = Scratch::new("no-trailing-nl");
         let f = s.write("t.ndjson", "{\"a\":1}\n{\"a\":2}\n{\"a\":3}");
