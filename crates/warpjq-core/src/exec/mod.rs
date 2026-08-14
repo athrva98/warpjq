@@ -72,9 +72,18 @@ pub struct RunStats {
     pub malformed: u64,
     /// Lines where a path hit a type error, e.g. `.a.b` with `.a` a number.
     pub type_errors: u64,
-    /// Lines the GPU handed back for the CPU to finish. Always 0 on the CPU
-    /// backend; a useful health signal on the GPU one.
+    /// Lines the kernel declined individually, for the CPU to finish. Normal
+    /// and cheap in small numbers. Always 0 on the CPU backend.
     pub gpu_fallback_lines: u64,
+    /// Chunks the device could not represent at all, and the lines in them.
+    ///
+    /// Separate from the count above because it means something different: not
+    /// a handful of awkward lines, but the GPU doing nothing for that stretch
+    /// of input while still reporting itself as the backend. Short lines are
+    /// the usual cause, since the index buffers are sized assuming at least 24
+    /// bytes a line.
+    pub gpu_redone_chunks: u64,
+    pub gpu_redone_lines: u64,
     pub elapsed: Duration,
 }
 
@@ -94,6 +103,8 @@ impl RunStats {
         self.malformed += other.malformed;
         self.type_errors += other.type_errors;
         self.gpu_fallback_lines += other.gpu_fallback_lines;
+        self.gpu_redone_chunks += other.gpu_redone_chunks;
+        self.gpu_redone_lines += other.gpu_redone_lines;
     }
 }
 

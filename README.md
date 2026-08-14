@@ -50,7 +50,7 @@ aggregates span all of them.
 | `--skip-invalid` | skip malformed lines without warning |
 | `-j`, `--threads` | CPU worker threads, 0 for one per core |
 | `--chunk-size`, `--max-line-bytes` | accept `256MB`, `1GB` |
-| `--stats` | timing and throughput to stderr |
+| `--stats` | timing, throughput, and how much of the input the GPU declined |
 
 Exit codes follow grep: 0 matched, 1 no match, 2 invalid query.
 

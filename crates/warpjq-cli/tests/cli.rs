@@ -830,6 +830,79 @@ mod pinned_reader {
         }
     }
 
+    /// A run where the device did none of the work has to say so. The index
+    /// buffers are sized at chunk/24 bytes a line, so short lines overflow
+    /// them and the whole chunk is redone on the CPU. The answer stays right,
+    /// which is why this needs reporting to be visible at all: without it the
+    /// run is indistinguishable from a fast GPU one.
+    #[test]
+    fn stats_report_chunks_that_ran_entirely_on_the_cpu() {
+        let s = Scratch::new("fallback-stats");
+        let mut data = String::new();
+        for i in 0..400_000 {
+            data.push_str(&format!(
+                "{{\"a\":{}}}
+",
+                i % 7
+            ));
+        }
+        let f = s.write("short.ndjson", &data);
+        let out = run(&[
+            "--backend",
+            "gpu",
+            "--chunk-size",
+            "1MB",
+            "--stats",
+            "select(.a == 3) | count",
+            &p(&f),
+        ]);
+        if no_gpu(&out.stderr) {
+            eprintln!("cli: SKIPPING, no GPU");
+            return;
+        }
+        assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+        assert!(
+            out.stderr.contains("ran entirely on the CPU"),
+            "a run the device sat out should say so, stderr: {}",
+            out.stderr
+        );
+        // And the answer is still right, which is the trap: correct output is
+        // not evidence the GPU did anything.
+        let cpu = run(&["--backend", "cpu", "select(.a == 3) | count", &p(&f)]);
+        assert_eq!(out.stdout, cpu.stdout);
+    }
+
+    #[test]
+    fn stats_stay_quiet_when_the_device_did_the_work() {
+        let s = Scratch::new("no-fallback-stats");
+        let mut data = String::new();
+        for i in 0..80_000 {
+            data.push_str(&format!(
+                "{{\"status\":{},\"host\":\"h{}\",\"path\":\"/some/route/{}\"}}
+",
+                if i % 5 == 0 { 500 } else { 200 },
+                i % 4,
+                i
+            ));
+        }
+        let f = s.write("normal.ndjson", &data);
+        let out = run(&[
+            "--backend",
+            "gpu",
+            "--stats",
+            "select(.status == 500) | count",
+            &p(&f),
+        ]);
+        if no_gpu(&out.stderr) {
+            return;
+        }
+        assert!(
+            !out.stderr.contains("ran entirely on the CPU"),
+            "lines this size fit the buffers, stderr: {}",
+            out.stderr
+        );
+    }
+
     #[test]
     fn a_file_with_no_trailing_newline_keeps_its_last_line() {
         let s = Scratch::new("no-trailing-nl");

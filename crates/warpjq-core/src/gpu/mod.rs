@@ -929,9 +929,15 @@ fn drain_slot<W: Write>(
         // The device could not represent this chunk exactly (too many lines
         // for the index buffers, or a group cardinality past the table).
         // Redo it on the CPU: slower for this chunk, still correct.
-        stats.gpu_fallback_lines += res.n_lines;
+        //
+        // Count what the CPU actually processed, not res.n_lines. On the
+        // too-many-lines path the device returns before filling any counter,
+        // so res.n_lines is 0 and adding it recorded nothing at all for the
+        // one case where the GPU did none of the work.
         let chunk = Chunk { data, first_line };
         let n = run_chunk_on_cpu(&chunk, plan, options, writer, totals, stats, file_name)?;
+        stats.gpu_redone_chunks += 1;
+        stats.gpu_redone_lines += n;
         *lines_seen += n;
         return Ok(());
     }

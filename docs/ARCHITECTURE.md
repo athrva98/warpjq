@@ -175,6 +175,13 @@ Per slot, at the default 64 MB GPU chunk:
 shortest legal NDJSON line is `{}`, so a pathological file holds 3x more. The
 device reports `chunk_overflow` and the host redoes that chunk on the CPU.
 
+Nothing pathological is required to hit it. `{"a":1}` is seven bytes, so a
+file of small records overflows every chunk and runs entirely on the CPU while
+`--stats` still names the backend `gpu`. That is why the redone chunks are
+counted and reported separately: correct output is not evidence the device did
+any work, and this case is invisible otherwise. The same 24-byte assumption is
+what let `k_nl_write` run off its buffer before it was given a bound.
+
 Per-line slot tables are not materialised. `k_eval` resolves paths into
 registers and the emit kernel re-resolves for surviving lines only, which costs
 less than storing `n_paths x 12 bytes x every line in the chunk`.

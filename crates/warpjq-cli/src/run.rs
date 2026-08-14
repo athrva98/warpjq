@@ -124,12 +124,26 @@ fn report(stats: &RunStats, options: &Options, verbose: bool) {
         lines_in = stats.lines_in,
         lines_out = stats.lines_out,
     );
+    let pct = |n: u64| n as f64 / stats.lines_in.max(1) as f64 * 100.0;
     if stats.gpu_fallback_lines > 0 {
-        let pct = stats.gpu_fallback_lines as f64 / stats.lines_in.max(1) as f64 * 100.0;
         eprintln!(
-            "warpjq: {} lines ({pct:.3}%) were finished on the CPU because the kernel \
+            "warpjq: {} lines ({:.3}%) were finished on the CPU because the kernel \
              could not decide them exactly",
-            stats.gpu_fallback_lines
+            stats.gpu_fallback_lines,
+            pct(stats.gpu_fallback_lines),
+        );
+    }
+    // Reported apart from the line count above, because it means the GPU did
+    // none of the work for that stretch while still naming itself the backend.
+    // A run that is entirely chunk fallback looks exactly like a fast GPU run
+    // without this line.
+    if stats.gpu_redone_chunks > 0 {
+        eprintln!(
+            "warpjq: {} chunks ({} lines, {:.1}%) ran entirely on the CPU: past a device \
+             limit, usually lines short enough to overflow the index buffers",
+            stats.gpu_redone_chunks,
+            stats.gpu_redone_lines,
+            pct(stats.gpu_redone_lines),
         );
     }
 }
