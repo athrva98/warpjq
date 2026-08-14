@@ -17,8 +17,8 @@ import subprocess
 
 import modal
 
-BASE = "0c33562"   # pinned reads, serial with submit
-HEAD = "0aa36df"   # reader thread overlaps them
+BASE = "0aa36df"   # three slots always
+HEAD = "6dc2dc9"   # slot count sized from input length
 REPO = "https://github.com/athrva98/warpjq"
 CUDA_ARCHS = "80,89,90"
 

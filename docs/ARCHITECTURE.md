@@ -233,8 +233,9 @@ memory as parsed JSON.
 
 GPU against CPU by input size, `select(.status == 500) | count`, H100 80 GB
 with 8 host cores. **The GPU column predates the input path rewrite** and is
-kept for the shape of the curve, not the values: 8 GB now runs in 0.520 s
-rather than 2.719 s. The sizes between have not been remeasured.
+kept for the shape of the curve, not the values: 8 GB now runs in 0.52 s to
+0.65 s depending on the container, rather than 2.719 s. The sizes between
+have not been remeasured.
 
 | input | gpu (old path) | cpu | ratio |
 |---|---|---|---|
@@ -245,22 +246,29 @@ rather than 2.719 s. The sizes between have not been remeasured.
 | 4 GB | 1.417 s | 2.455 s | 1.73x |
 | 8 GB | 2.719 s | 5.451 s | 2.00x |
 
-Against DuckDB 1.5.5 `read_ndjson_auto`, H100, 8 host cores, 8 GB, each timed
-in a fresh process so neither side reuses a parse:
+Against DuckDB 1.5.5 `read_ndjson_auto`, H100, 8 host cores, each timed in a
+fresh process so neither side reuses a parse. Answers were compared before
+either side was timed and agreed exactly on every query.
 
-| query | warpjq | duckdb |
-|---|---|---|
-| `select(.status == 500) \| count` | 0.520 s | 0.927 s |
-| `select(.status >= 500) \| {p: .path, b: .bytes}` | 0.737 s | 1.172 s |
-| `group_by(.host) \| count` | 0.491 s | 0.988 s |
-| `select(.status == 500)` | 0.731 s | 1.916 s |
+| query | 1 GB | | 8 GB | |
+|---|---|---|---|---|
+| | warpjq | duckdb | warpjq | duckdb |
+| `select(.status == 500) \| count` | 0.339 s | 0.367 s | 0.646 s | 1.048 s |
+| `select(.status >= 500) \| {p: .path, b: .bytes}` | 0.501 s | 0.397 s | 0.906 s | 1.338 s |
+| `group_by(.host) \| count` | 0.362 s | 0.378 s | 0.655 s | 1.103 s |
+| `select(.status == 500)` | 0.509 s | 0.470 s | 0.907 s | 2.084 s |
 
-At 1 GB DuckDB wins the same filter-and-count, 0.297 s against 0.316 s. The
-crossover was not measured; it is somewhere between 1 and 8 GB. Answers were
-compared before either side was timed, and agreed exactly on every query.
-DuckDB is doing schema inference here, which is what a user typing
-`read_ndjson_auto` actually pays, but it does mean this is not a pure scan
-comparison.
+The noise floor is worth knowing before reading any of this. In the run that
+produced the 8 GB column, the two warpjq builds under test were behaviourally
+identical at that size, since both allocate three slots above 32 chunks, and
+they still measured up to 5% apart. Between containers it is worse: DuckDB's
+own 8 GB count came out at 0.927 s in one run and 1.048 s in another, 13%
+apart, and warpjq's at 0.520 s and 0.646 s, 24% apart. Ratios within a single
+run are the only figures here that carry.
+
+DuckDB is doing schema inference, which is what a user typing
+`read_ndjson_auto` actually pays, so this is an end-to-end comparison rather
+than a pure scan one. Passing explicit columns would make it faster.
 
 Per-device, same 1 GB file, 8 host cores, PCIe sampled under load:
 

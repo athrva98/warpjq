@@ -83,16 +83,22 @@ same data on an H100:
 
 | | warpjq | duckdb 1.5.5 | |
 |---|---|---|---|
-| `select(.status == 500) \| count` | 0.520 s | 0.927 s | 1.78x |
-| `select(.status >= 500) \| {p: .path, b: .bytes}` | 0.737 s | 1.172 s | 1.59x |
-| `group_by(.host) \| count` | 0.491 s | 0.988 s | 2.01x |
-| `select(.status == 500)` | 0.731 s | 1.916 s | 2.62x |
+| `select(.status == 500) \| count` | 0.646 s | 1.048 s | 1.62x |
+| `select(.status >= 500) \| {p: .path, b: .bytes}` | 0.906 s | 1.338 s | 1.48x |
+| `group_by(.host) \| count` | 0.655 s | 1.103 s | 1.68x |
+| `select(.status == 500)` | 0.907 s | 2.084 s | 2.30x |
 
-At 1 GB DuckDB wins the same filter-and-count, 0.30 s against 0.32 s, because
-CUDA context creation costs about 0.2 s whatever the input size. The crossover
-was not measured and is somewhere between. DuckDB also answers a far wider
-range of questions than this subset of jq does; the comparison is one query
-shape on one file, not a general claim.
+At 1 GB the two are close enough that the ordering depends on the query:
+warpjq takes the count 0.339 s to 0.367 s and the group_by 0.362 s to
+0.378 s, DuckDB takes the projection 0.397 s to 0.501 s and the passthrough
+0.470 s to 0.509 s. CUDA context creation costs about 0.2 s whatever the
+input size, which is most of why the margin closes.
+
+Treat small differences here as noise. Two builds that are byte for byte
+identical at 8 GB measured 5% apart in one run, and DuckDB's own 8 GB count
+varied 24% between containers. Only differences well outside that are worth
+reading, and none of this says anything about the far wider range of
+questions DuckDB answers.
 
 The CUDA backend overtakes warpjq's own CPU backend above roughly 1.5 GB.
 Below that the CPU backend is faster, by a wide margin on small inputs, for
