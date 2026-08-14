@@ -17,9 +17,12 @@ use crate::query::Program;
 
 pub use lower::LoweredProgram;
 
-/// Double buffering, exactly as described in docs/ARCHITECTURE.md: while one
-/// chunk is uploading and computing, the previous one is being drained.
-const N_SLOTS: u32 = 2;
+/// Three, not two, because three things are happening at once on the file
+/// path: one slot is being filled by the reader thread, one is on the device,
+/// and one is being drained. Two slots were enough only while the read and the
+/// submit ran back to back on the same thread, which is exactly the
+/// serialisation the reader thread removes.
+const N_SLOTS: u32 = 3;
 
 /// GPU chunks are smaller than the CPU default. The index arrays are sized off
 /// this, and smaller chunks also overlap better, since there is nothing to hide
@@ -244,98 +247,157 @@ impl Backend for GpuBackend {
         // (stdin, a chain of files) has no stable extent to read positionally,
         // and keeps the chunker.
         if let Some((file, len)) = input.file() {
-            let mut rd = PinnedReader::new(file, len, options.max_line_bytes);
-            // Reused across chunks so a file with many long lines does not
-            // reallocate for each one.
-            let mut long_line: Vec<u8> = Vec::new();
-            while !rd.done() && abort.is_none() {
-                let slot = (chunk_no % N_SLOTS as u64) as u32;
-                let buf = unsafe { ffi::warpjq_slot_buffer(ctx, slot) };
-                if buf.is_null() {
-                    abort = Some(WarpError::other("device buffer is unavailable"));
-                    break;
-                }
-                let t = std::time::Instant::now();
-                let got = match rd.next_chunk(buf, cap) {
-                    Ok(g) => g,
-                    Err(e) => {
-                        abort = Some(e);
-                        break;
-                    }
-                };
-                prof.read += t.elapsed();
-                let Some(n_bytes) = got else {
-                    // One line longer than the whole buffer. Take just that
-                    // line on the CPU and carry on with the device for the
-                    // rest of the file.
-                    //
-                    // Draining first is not optional: the CPU path writes
-                    // straight to the shared writer, so running it while a
-                    // chunk is still on the device would put this line's rows
-                    // ahead of that chunk's. Output order is input order.
-                    if let Some(prev) = in_flight.take() {
-                        if let Err(e) = drain(
-                            &prev,
-                            writer,
-                            &mut totals,
-                            &mut stats,
-                            &mut prof,
-                            &mut lines_seen,
-                        ) {
-                            abort = Some(e);
+            // Resolved before the reader starts, so no device pointer has to
+            // cross a thread boundary.
+            let bufs: Vec<usize> = (0..N_SLOTS)
+                .map(|s| unsafe { ffi::warpjq_slot_buffer(ctx, s) } as usize)
+                .collect();
+            if bufs.iter().any(|&b| b == 0) {
+                return Err(WarpError::other("device staging buffer is unavailable"));
+            }
+            let max_line = options.max_line_bytes;
+
+            std::thread::scope(|scope| {
+                let (req_tx, req_rx) = std::sync::mpsc::channel::<u32>();
+                let (res_tx, res_rx) = std::sync::mpsc::channel::<(ReadOut, bool)>();
+
+                scope.spawn(move || {
+                    let mut rd = PinnedReader::new(file, len, max_line);
+                    while let Ok(slot) = req_rx.recv() {
+                        let dst = bufs[slot as usize] as *mut u8;
+                        let out = match rd.next_chunk(dst, cap) {
+                            Ok(Some(n)) => ReadOut::Chunk(n),
+                            Ok(None) => {
+                                let mut v = Vec::new();
+                                match rd.take_long_line(&mut v) {
+                                    Ok(()) => ReadOut::LongLine(v),
+                                    Err(e) => ReadOut::Fail(e),
+                                }
+                            }
+                            Err(e) => ReadOut::Fail(e),
+                        };
+                        // Unbounded channel, so this never blocks and the
+                        // reader is always free to take the next request.
+                        if res_tx.send((out, rd.done())).is_err() {
                             break;
                         }
                     }
-                    if let Err(e) = rd.take_long_line(&mut long_line) {
-                        abort = Some(e);
-                        break;
-                    }
-                    stats.bytes_in += long_line.len() as u64;
-                    let chunk = Chunk {
-                        data: &long_line,
-                        first_line: lines_seen + 1,
-                    };
-                    match run_chunk_on_cpu(
-                        &chunk,
-                        &plan,
-                        options,
-                        writer,
-                        &mut totals,
-                        &mut stats,
-                        &file_name,
-                    ) {
-                        Ok(n) => lines_seen += n,
-                        Err(e) => abort = Some(e),
-                    }
-                    continue;
-                };
-                if n_bytes == 0 {
-                    break;
-                }
-                stats.bytes_in += n_bytes as u64;
-                prof.bytes += n_bytes as u64;
+                });
 
-                if let Err(e) = submit(ctx, slot, n_bytes, &mut prof) {
-                    abort = Some(e);
-                    break;
+                let mut cur = 0u32;
+                if req_tx.send(cur).is_err() {
+                    return;
                 }
-                let queued = InFlight { slot, n_bytes };
-                if let Some(prev) = in_flight.take() {
-                    if let Err(e) = drain(
-                        &prev,
-                        writer,
-                        &mut totals,
-                        &mut stats,
-                        &mut prof,
-                        &mut lines_seen,
-                    ) {
-                        abort = Some(e);
-                        break;
+
+                loop {
+                    let t = std::time::Instant::now();
+                    let Ok((out, done)) = res_rx.recv() else { break };
+                    // What is left here is the part of the read that could not
+                    // be hidden behind device work. It should be near zero
+                    // once the reader is a chunk ahead.
+                    prof.read += t.elapsed();
+
+                    match out {
+                        ReadOut::Fail(e) => {
+                            abort = Some(e);
+                            break;
+                        }
+                        ReadOut::Chunk(0) => break,
+                        ReadOut::Chunk(n_bytes) => {
+                            let this = cur;
+                            // Ask for the next chunk before submitting this
+                            // one. That ordering is the entire point: the read
+                            // then runs while this thread is blocked in the
+                            // driver. The slot is free because with three of
+                            // them the next one last held chunk n-2, drained
+                            // on the previous iteration.
+                            if !done {
+                                chunk_no += 1;
+                                cur = (chunk_no % N_SLOTS as u64) as u32;
+                                if req_tx.send(cur).is_err() {
+                                    abort = Some(WarpError::other("the input reader stopped"));
+                                    break;
+                                }
+                            }
+                            stats.bytes_in += n_bytes as u64;
+                            prof.bytes += n_bytes as u64;
+                            if let Err(e) = submit(ctx, this, n_bytes, &mut prof) {
+                                abort = Some(e);
+                                break;
+                            }
+                            let queued = InFlight {
+                                slot: this,
+                                n_bytes,
+                            };
+                            if let Some(prev) = in_flight.take() {
+                                if let Err(e) = drain(
+                                    &prev,
+                                    writer,
+                                    &mut totals,
+                                    &mut stats,
+                                    &mut prof,
+                                    &mut lines_seen,
+                                ) {
+                                    abort = Some(e);
+                                    break;
+                                }
+                            }
+                            in_flight = Some(queued);
+                            if done {
+                                break;
+                            }
+                        }
+                        ReadOut::LongLine(bytes) => {
+                            // Draining first is not optional: the CPU path
+                            // writes straight to the shared writer, so leaving
+                            // a chunk on the device would put this line's rows
+                            // ahead of it. Output order is input order.
+                            if let Some(prev) = in_flight.take() {
+                                if let Err(e) = drain(
+                                    &prev,
+                                    writer,
+                                    &mut totals,
+                                    &mut stats,
+                                    &mut prof,
+                                    &mut lines_seen,
+                                ) {
+                                    abort = Some(e);
+                                    break;
+                                }
+                            }
+                            stats.bytes_in += bytes.len() as u64;
+                            let chunk = Chunk {
+                                data: &bytes,
+                                first_line: lines_seen + 1,
+                            };
+                            match run_chunk_on_cpu(
+                                &chunk,
+                                &plan,
+                                options,
+                                writer,
+                                &mut totals,
+                                &mut stats,
+                                &file_name,
+                            ) {
+                                Ok(n) => lines_seen += n,
+                                Err(e) => {
+                                    abort = Some(e);
+                                    break;
+                                }
+                            }
+                            if done {
+                                break;
+                            }
+                            chunk_no += 1;
+                            cur = (chunk_no % N_SLOTS as u64) as u32;
+                            if req_tx.send(cur).is_err() {
+                                abort = Some(WarpError::other("the input reader stopped"));
+                                break;
+                            }
+                        }
                     }
                 }
-                in_flight = Some(queued);
-                chunk_no += 1;
-            }
+            });
 
             if let Some(prev) = in_flight.take() {
                 if abort.is_none() {
@@ -521,6 +583,15 @@ fn submit(ctx: *mut ffi::Ctx, slot: u32, n_bytes: usize, prof: &mut Profile) -> 
     }
     prof.submit += t.elapsed();
     Ok(())
+}
+
+/// What the reader thread hands back for one request.
+enum ReadOut {
+    /// Bytes are in the slot buffer. Zero means end of input.
+    Chunk(usize),
+    /// A line too long for a slot, already read out on its own.
+    LongLine(Vec<u8>),
+    Fail(WarpError),
 }
 
 /// Reads the file directly into the pinned buffers the DMA engine reads from.
