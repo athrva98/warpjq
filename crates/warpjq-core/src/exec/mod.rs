@@ -264,13 +264,46 @@ pub fn run_bytes(
     options: &Options,
     preference: Preference,
 ) -> Result<(Vec<u8>, RunStats)> {
-    // A temp file, not a cursor: the GPU backend wants a mapping, and this
-    // keeps both backends on the same input path as a real run.
-    let mut input = Input::from_bytes(data);
+    // A temp file, not a cursor. This comment used to say exactly that while
+    // the code below passed a cursor, and the difference is not cosmetic: a
+    // cursor is a stream, and the GPU backend serves streams with the chunker
+    // rather than with the reader it uses for real files. The entire
+    // differential suite was therefore testing a path no real invocation
+    // takes. Writing the bytes out first costs a little and puts both backends
+    // on the same input path a user gets.
+    let path = scratch_path();
+    let mut input = match std::fs::write(&path, data).and_then(|_| Input::open(&path)) {
+        Ok(i) => i,
+        // A read-only or missing temp dir should not turn every test into a
+        // failure about the filesystem; fall back to the stream path.
+        Err(_) => Input::from_bytes(data),
+    };
+    let _cleanup = ScratchFile(path);
     let mut writer = Writer::new(Vec::new(), options.format);
     let stats = run_query(program, &mut input, options, &mut writer, preference)?;
     let (bytes, _) = writer.finish()?;
     Ok((bytes, stats))
+}
+
+/// A counter, not the data address: addresses repeat once the allocator reuses
+/// them, and every empty slice shares one, so two of these running in parallel
+/// would collide on a filename and read each other's bytes.
+fn scratch_path() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "warpjq-run-{}-{}.ndjson",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+struct ScratchFile(std::path::PathBuf);
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Writes the terminal rows for an aggregate query and returns the row count.

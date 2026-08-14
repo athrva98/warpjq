@@ -30,9 +30,18 @@ pub struct Chunk<'a> {
 
 /// Where the bytes come from.
 pub enum Input {
-    /// A regular file, mapped. Chunks borrow directly from the mapping, so
-    /// there is no copy before the GPU staging buffer.
-    Mapped { map: Mmap, name: String },
+    /// A regular file, mapped.
+    ///
+    /// The handle is kept beside the mapping because the GPU backend does not
+    /// read through the mapping at all: it reads the file straight into its
+    /// pinned pool, which needs positional reads. The mapping stays for the
+    /// CPU backend, and for the one case the pinned reader cannot serve, a
+    /// single line longer than a whole chunk.
+    Mapped {
+        map: Mmap,
+        file: File,
+        name: String,
+    },
     /// stdin or anything else non-seekable, read into a growable buffer.
     Streamed {
         reader: Box<dyn Read + Send>,
@@ -68,7 +77,7 @@ impl Input {
                 // We stream front-to-back exactly once.
                 let _ = map.advise(memmap2::Advice::Sequential);
             }
-            return Ok(Input::Mapped { map, name });
+            return Ok(Input::Mapped { map, file, name });
         }
         Ok(Input::Streamed {
             reader: Box::new(file),
@@ -96,6 +105,23 @@ impl Input {
             Input::Mapped { name, .. }
             | Input::Streamed { name, .. }
             | Input::Chained { name, .. } => name,
+        }
+    }
+
+    /// The whole mapping, when there is one.
+    pub fn mapping(&self) -> Option<&[u8]> {
+        match self {
+            Input::Mapped { map, .. } => Some(&map[..]),
+            _ => None,
+        }
+    }
+
+    /// The open handle and byte length, for backends that read the file
+    /// themselves into a buffer they already own.
+    pub fn file(&self) -> Option<(&File, u64)> {
+        match self {
+            Input::Mapped { file, map, .. } => Some((file, map.len() as u64)),
+            _ => None,
         }
     }
 

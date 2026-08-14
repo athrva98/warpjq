@@ -603,10 +603,18 @@ fn jq_preserves_number_literals() -> bool {
 /// while and then hung. A file has no such failure mode, and it is also how
 /// `warpjq bench` invokes jq, so the two agree on what is being measured.
 fn run_jq(jq: &str, args: &[&str], expr: &str, data: &[u8]) -> Option<String> {
+    // A counter, not the data address. Addresses are not unique: the allocator
+    // hands the same one back after a free, and every empty slice shares a
+    // dangling one. Two tests running in parallel would then agree on a
+    // filename, so one would read the other's bytes or delete the file while
+    // the other's jq still had it open. That showed up as a different test
+    // failing on each run, which reads like flakiness rather than a race and
+    // makes a green suite mean very little.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "warpjq-jq-input-{}-{:p}.ndjson",
-        std::process::id(),
-        data.as_ptr()
+        "warpjq-jq-input-{}-{n}.ndjson",
+        std::process::id()
     ));
     std::fs::write(&path, data).ok()?;
     let out = Command::new(jq)

@@ -157,6 +157,31 @@ impl<W: Write> Writer<W> {
         self.maybe_flush()
     }
 
+    /// Writes an already-formatted block of many rows.
+    ///
+    /// The GPU assembles a chunk's rows into one contiguous ordered block, so
+    /// copying it into `buf` only to copy it out again is a whole extra pass
+    /// over the output. Past the flush threshold this hands the block to the
+    /// sink directly, which costs one `write_all` instead of a copy plus a
+    /// later one. Below the threshold buffering still wins, because the
+    /// syscall dominates.
+    pub fn write_bulk(&mut self, bytes: &[u8], rows: u64) -> io::Result<()> {
+        self.rows += rows;
+        if self.format == Format::CountOnly || bytes.is_empty() {
+            return Ok(());
+        }
+        if bytes.len() < self.flush_at {
+            self.buf.extend_from_slice(bytes);
+            return self.maybe_flush();
+        }
+        // Anything already buffered was produced earlier and must land first.
+        if !self.buf.is_empty() {
+            self.inner.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        self.inner.write_all(bytes)
+    }
+
     /// Emits the CSV header row once, if the query has a static shape.
     pub fn write_header(&mut self, program: &Program) -> io::Result<()> {
         if self.format != Format::Csv || self.header_written {
