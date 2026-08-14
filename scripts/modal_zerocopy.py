@@ -1,17 +1,13 @@
-"""Does removing the staging copy actually move the wall clock?
+"""A/B two commits of the GPU input path, with DuckDB as the reference.
 
-The copy was 73% of an 8 GB run in an earlier profile, which is the whole
-reason for the zero-copy path. But that profile was taken in a 64 GB
-container under page-cache pressure, and a later 128 GB run did the same
-8 GB in 0.884 s total, so the copy cannot have been 2 s there. The share is
-a function of memory pressure, not a constant, and the only way to know what
-pinning buys is to measure both paths on the same machine and file.
+Both are built into one image and run against the same file on the same
+machine with the same page-cache state. That matters more than it sounds:
+the same binary measured 0.995 s and 0.737 s for an 8 GB count in two
+different containers. Only the within-run ratio means anything, so never
+compare a number here against one from another run.
 
-One binary runs both: WARPJQ_NO_PIN=1 forces the staging path. So this is an
-A/B of two code paths on identical hardware, data and page-cache state,
-rather than two builds compared across runs.
-
-DuckDB is measured alongside as the bar that matters.
+Set BASE and HEAD to the commits under test. Output has to be byte identical
+between them before either is timed.
 
     modal run scripts/modal_zerocopy.py
 """
@@ -21,11 +17,12 @@ import subprocess
 
 import modal
 
-COMMIT = "126d896078e4d17350645a247b8efe19de7dd7ac"
+BASE = "0c33562"   # pinned reads, serial with submit
+HEAD = "0aa36df"   # reader thread overlaps them
 REPO = "https://github.com/athrva98/warpjq"
 CUDA_ARCHS = "80,89,90"
 
-app = modal.App("warpjq-zerocopy")
+app = modal.App("warpjq-inputpath")
 
 image = (
     modal.Image.from_registry(
@@ -36,13 +33,17 @@ image = (
     .run_commands(
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
         "| sh -s -- -y --profile minimal --default-toolchain stable",
-        f"git clone {REPO} /warpjq && cd /warpjq && git checkout {COMMIT}",
-        f"cd /warpjq && . $HOME/.cargo/env && WARPJQ_CUDA_ARCH='{CUDA_ARCHS}' "
+        f"git clone {REPO} /base && cd /base && git checkout {BASE}",
+        f"git clone {REPO} /head && cd /head && git checkout {HEAD}",
+        f"cd /base && . $HOME/.cargo/env && WARPJQ_CUDA_ARCH='{CUDA_ARCHS}' "
+        "cargo build --release -p warpjq-cli --features cuda",
+        f"cd /head && . $HOME/.cargo/env && WARPJQ_CUDA_ARCH='{CUDA_ARCHS}' "
         "cargo build --release -p warpjq-cli --features cuda",
     )
 )
 
-W = "/warpjq/target/release/warpjq"
+BASE_BIN = "/base/target/release/warpjq"
+HEAD_BIN = "/head/target/release/warpjq"
 
 CASES = [
     ("count matching", "select(.status == 500) | count",
@@ -64,7 +65,7 @@ def sh(cmd: str, env: str = "", timeout: int = 3600) -> str:
     return (p.stdout or "") + (p.stderr or "")
 
 
-def timed(query: str, path: str, env: str = "", runs: int = 7):
+def timed(W: str, query: str, path: str, env: str = "", runs: int = 7):
     times = []
     for _ in range(runs):
         out = sh(f"{W} '{query}' --backend gpu --stats {path} > /dev/null", env)
@@ -74,7 +75,7 @@ def timed(query: str, path: str, env: str = "", runs: int = 7):
     return min(times) if times else None
 
 
-def profile(query: str, path: str, env: str = "") -> dict:
+def profile(W: str, query: str, path: str, env: str = "") -> dict:
     out = sh(f"WARPJQ_PROFILE=1 {W} '{query}' --backend gpu {path} > /dev/null", env)
     stages = {}
     for line in out.splitlines():
@@ -107,21 +108,20 @@ def duckdb_time(sql: str, path: str, runs: int = 5):
 
 @app.function(image=image, gpu="H100", cpu=8.0, memory=131072, timeout=7200)
 def run():
-    out = {"sizes": {}}
+    out = {"base": BASE, "head": HEAD, "sizes": {}}
     for size in ("1GB", "8GB"):
-        sh(f"{W} gen --preset nginx --size {size} -o /tmp/z.ndjson --seed 1")
+        sh(f"{HEAD_BIN} gen --preset nginx --size {size} -o /tmp/z.ndjson --seed 1")
         sh("cat /tmp/z.ndjson > /dev/null")
 
         rows = {}
         for label, wq, sql in CASES:
             # Both paths must produce identical bytes before either is timed.
-            sh(f"{W} '{wq}' --backend gpu /tmp/z.ndjson > /tmp/pin.out")
-            sh(f"{W} '{wq}' --backend gpu /tmp/z.ndjson > /tmp/stg.out",
-               env="WARPJQ_NO_PIN=1")
+            sh(f"{HEAD_BIN} '{wq}' --backend gpu /tmp/z.ndjson > /tmp/pin.out")
+            sh(f"{BASE_BIN} '{wq}' --backend gpu /tmp/z.ndjson > /tmp/stg.out")
             same = "differ" not in sh("cmp /tmp/pin.out /tmp/stg.out || echo differ")
             rows[label] = {
-                "pinned": timed(wq, "/tmp/z.ndjson"),
-                "staging": timed(wq, "/tmp/z.ndjson", env="WARPJQ_NO_PIN=1"),
+                "head": timed(HEAD_BIN, wq, "/tmp/z.ndjson"),
+                "base": timed(BASE_BIN, wq, "/tmp/z.ndjson"),
                 "duckdb": duckdb_time(sql, "/tmp/z.ndjson"),
                 "identical": same,
             }
@@ -129,8 +129,8 @@ def run():
 
         out["sizes"][size] = {
             "timings": rows,
-            "profile_pinned": profile(CASES[0][1], "/tmp/z.ndjson"),
-            "profile_staging": profile(CASES[0][1], "/tmp/z.ndjson", "WARPJQ_NO_PIN=1"),
+            "profile_head": profile(HEAD_BIN, CASES[0][1], "/tmp/z.ndjson"),
+            "profile_base": profile(BASE_BIN, CASES[0][1], "/tmp/z.ndjson"),
         }
         sh("rm -f /tmp/z.ndjson")
     return out
@@ -142,19 +142,19 @@ def main():
     with open("modal_zerocopy.json", "w", encoding="utf-8") as fh:
         json.dump(r, fh, indent=2)
 
+    print(f"base {r['base']} -> head {r['head']}, H100\n")
     for size, s in r["sizes"].items():
-        print(f"=== {size} on H100 ===")
-        print(f"  {'query':<16} {'staging':>9} {'pinned':>9} {'speedup':>9} "
-              f"{'duckdb':>9} {'pinned vs duckdb':>18}")
+        print(f"=== {size} ===")
+        print(f"  {'query':<16} {'base':>9} {'head':>9} {'speedup':>9} "
+              f"{'duckdb':>9} {'head vs duckdb':>16}")
         for label, t in s["timings"].items():
-            p, g, d = t["pinned"], t["staging"], t["duckdb"]
+            b, h, d = t["base"], t["head"], t["duckdb"]
             flag = "" if t["identical"] else "  OUTPUT DIFFERS"
-            vs = f"{d / p:.2f}x" if d and p else "n/a"
-            print(f"  {label:<16} {g:>9.3f} {p:>9.3f} {g / p:>8.2f}x "
-                  f"{(d or 0):>9.3f} {vs:>18}{flag}")
-        print("  stages, staging -> pinned:")
-        keys = list(s["profile_staging"]) or list(s["profile_pinned"])
-        for k in keys:
-            print(f"    {k:<24} {s['profile_staging'].get(k, '?'):>8} -> "
-                  f"{s['profile_pinned'].get(k, '?'):>8}")
+            vs = f"{d / h:.2f}x" if d and h else "n/a"
+            print(f"  {label:<16} {b:>9.3f} {h:>9.3f} {b / h:>8.2f}x "
+                  f"{(d or 0):>9.3f} {vs:>16}{flag}")
+        print("  stages, base -> head:")
+        for k in (list(s["profile_base"]) or list(s["profile_head"])):
+            print(f"    {k:<24} {s['profile_base'].get(k, '?'):>8} -> "
+                  f"{s['profile_head'].get(k, '?'):>8}")
         print()

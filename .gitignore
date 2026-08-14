@@ -7,4 +7,7 @@
 /modal_results.json
 /modal_ab_results.json
 /modal_h100_repeat.json
+/modal_duckdb.json
+/modal_zerocopy.json
+/modal_bigfile.json
 __pycache__/
