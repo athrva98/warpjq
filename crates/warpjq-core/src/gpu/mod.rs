@@ -240,6 +240,96 @@ impl Backend for GpuBackend {
             )
         };
 
+        // A real file is read straight into the pinned pool. Everything else
+        // (stdin, a chain of files) has no stable extent to read positionally,
+        // and keeps the chunker.
+        if let Some((file, len)) = input.file() {
+            let mut rd = PinnedReader::new(file, len, options.max_line_bytes);
+            let mut oversized: Option<u64> = None;
+            while !rd.done() && abort.is_none() {
+                let slot = (chunk_no % N_SLOTS as u64) as u32;
+                let buf = unsafe { ffi::warpjq_slot_buffer(ctx, slot) };
+                if buf.is_null() {
+                    abort = Some(WarpError::other("device buffer is unavailable"));
+                    break;
+                }
+                let t = std::time::Instant::now();
+                let got = match rd.next_chunk(buf, cap) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        abort = Some(e);
+                        break;
+                    }
+                };
+                prof.read += t.elapsed();
+                let Some(n_bytes) = got else {
+                    // One line longer than the whole buffer. Rare enough to be
+                    // worth handling by rereading that stretch through the
+                    // mapping rather than complicating the fast path.
+                    oversized = Some(rd.off);
+                    break;
+                };
+                if n_bytes == 0 {
+                    break;
+                }
+                stats.bytes_in += n_bytes as u64;
+                prof.bytes += n_bytes as u64;
+
+                if let Err(e) = submit(ctx, slot, n_bytes, &mut prof) {
+                    abort = Some(e);
+                    break;
+                }
+                let queued = InFlight { slot, n_bytes };
+                if let Some(prev) = in_flight.take() {
+                    if let Err(e) = drain(
+                        &prev,
+                        writer,
+                        &mut totals,
+                        &mut stats,
+                        &mut prof,
+                        &mut lines_seen,
+                    ) {
+                        abort = Some(e);
+                        break;
+                    }
+                }
+                in_flight = Some(queued);
+                chunk_no += 1;
+            }
+
+            if let Some(prev) = in_flight.take() {
+                if abort.is_none() {
+                    if let Err(e) = drain(
+                        &prev,
+                        writer,
+                        &mut totals,
+                        &mut stats,
+                        &mut prof,
+                        &mut lines_seen,
+                    ) {
+                        abort = Some(e);
+                    }
+                }
+            }
+
+            if let (Some(from), None) = (oversized, abort.as_ref()) {
+                if let Err(e) = run_tail_on_cpu(
+                    input, from, &plan, options, writer, &mut totals, &mut stats,
+                    &mut lines_seen,
+                ) {
+                    abort = Some(e);
+                }
+            }
+
+            prof.report();
+            if let Some(e) = abort {
+                return Err(e);
+            }
+            finish_totals(program, totals, writer)?;
+            stats.lines_out = writer.rows();
+            return Ok(stats);
+        }
+
         input.for_each_chunk(cap, options.max_line_bytes, |chunk| {
             if abort.is_some() {
                 return Ok(0);
@@ -384,6 +474,214 @@ impl Drop for MergeTimer<'_> {
     fn drop(&mut self) {
         *self.acc += self.start.elapsed();
     }
+}
+
+/// Queues H2D and the kernels for bytes already sitting in the slot's buffer.
+fn submit(ctx: *mut ffi::Ctx, slot: u32, n_bytes: usize, prof: &mut Profile) -> Result<()> {
+    let t = std::time::Instant::now();
+    let mut err = ffi::ErrBuf::new();
+    let rc = unsafe { ffi::warpjq_submit(ctx, slot, n_bytes as u64, err.as_mut_ptr(), err.len()) };
+    if rc != ffi::OK {
+        return Err(WarpError::Cuda {
+            op: "submitting a chunk",
+            detail: ffi::status_message(rc, &err),
+        });
+    }
+    prof.submit += t.elapsed();
+    Ok(())
+}
+
+/// Finishes a file on the CPU from `from` onward.
+///
+/// Only reachable when a single line is longer than the whole buffer, which
+/// the pinned reader cannot split. Reading it through the mapping keeps that
+/// case out of the path every other chunk takes.
+#[allow(clippy::too_many_arguments)]
+fn run_tail_on_cpu<W: Write>(
+    input: &Input,
+    from: u64,
+    plan: &crate::exec::cpu::Plan,
+    options: &Options,
+    writer: &mut Writer<W>,
+    totals: &mut Totals,
+    stats: &mut RunStats,
+    lines_seen: &mut u64,
+) -> Result<()> {
+    let Some(map) = input.mapping() else {
+        return Err(WarpError::other(
+            "a line is longer than the chunk buffer and the input cannot be re-read",
+        ));
+    };
+    let data = &map[from as usize..];
+    stats.bytes_in += data.len() as u64;
+    let chunk = Chunk {
+        data,
+        first_line: *lines_seen + 1,
+    };
+    let name = input.name().to_string();
+    let n = run_chunk_on_cpu(&chunk, plan, options, writer, totals, stats, &name)?;
+    *lines_seen += n;
+    Ok(())
+}
+
+/// Reads the file directly into the pinned buffers the DMA engine reads from.
+///
+/// The bytes land once, in the only buffer that holds them. There is no
+/// mapping to fault in and no staging copy, because there is nothing to stage
+/// from: the destination is the pinned pool the context already allocated.
+struct PinnedReader<'a> {
+    file: &'a std::fs::File,
+    len: u64,
+    off: u64,
+    max_line: usize,
+    lines_before: u64,
+}
+
+impl<'a> PinnedReader<'a> {
+    fn new(file: &'a std::fs::File, len: u64, max_line: usize) -> Self {
+        PinnedReader {
+            file,
+            len,
+            // A byte-order mark is not part of the first line. The mapped
+            // path strips it with strip_bom; here it is simpler to start
+            // reading past it.
+            off: bom_len(file, len),
+            max_line,
+            lines_before: 0,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.off >= self.len
+    }
+
+    /// Fills `dst` with the next whole lines, returning how many bytes.
+    ///
+    /// Returns `Ok(None)` when the next line is longer than the buffer, which
+    /// positional reads cannot serve without splitting it; the caller falls
+    /// back for that chunk.
+    fn next_chunk(&mut self, dst: *mut u8, cap: usize) -> Result<Option<usize>> {
+        let want = cap.min((self.len - self.off) as usize);
+        // SAFETY: `dst` is the slot's pinned buffer, `cap` bytes long, and this
+        // slot is not in flight.
+        let buf = unsafe { std::slice::from_raw_parts_mut(dst, want) };
+        let n = read_parallel(self.file, buf, self.off)?;
+        if n == 0 {
+            self.off = self.len;
+            return Ok(Some(0));
+        }
+
+        let at_eof = self.off + n as u64 >= self.len;
+        let end = if at_eof {
+            n
+        } else {
+            // Chunks end on a line boundary. The bytes past the last newline
+            // are re-read as the head of the next chunk rather than moved
+            // down, which keeps the buffer write-once.
+            match buf[..n].iter().rposition(|&b| b == b'\n') {
+                Some(p) => p + 1,
+                None => return Ok(None),
+            }
+        };
+
+        // Enforcing --max-line-bytes needs the longest run without a newline,
+        // which is a second pass over the chunk. Skip it when the limit is at
+        // least a whole buffer, because then no line inside one can exceed it
+        // and a line that spans buffers is caught by the no-newline case above.
+        // That covers the default, where the limit equals the chunk size, so
+        // the common path never pays for the scan.
+        if self.max_line < buf.len() {
+            let mut start = 0usize;
+            for (i, _) in buf[..end].iter().enumerate().filter(|(_, &b)| b == b'\n') {
+                if i - start > self.max_line {
+                    return Err(WarpError::LineTooLong {
+                        line: self.lines_before + 1,
+                        len: i - start,
+                        limit: self.max_line,
+                    });
+                }
+                start = i + 1;
+                self.lines_before += 1;
+            }
+            if end - start > self.max_line {
+                return Err(WarpError::LineTooLong {
+                    line: self.lines_before + 1,
+                    len: end - start,
+                    limit: self.max_line,
+                });
+            }
+        }
+
+        self.off += end as u64;
+        Ok(Some(end))
+    }
+}
+
+/// Length of a leading UTF-8 byte-order mark, which Windows tooling prepends
+/// and which would otherwise make the first line fail to parse.
+fn bom_len(file: &std::fs::File, len: u64) -> u64 {
+    if len < 3 {
+        return 0;
+    }
+    let mut head = [0u8; 3];
+    match read_fully(file, &mut head, 0) {
+        Ok(3) if head == [0xEF, 0xBB, 0xBF] => 3,
+        _ => 0,
+    }
+}
+
+#[cfg(unix)]
+fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(f, buf, off)
+}
+
+#[cfg(windows)]
+fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(f, buf, off)
+}
+
+/// Fills `buf` from `off`, splitting the range across cores.
+///
+/// One thread reading 64 MB is a single core's worth of copy bandwidth, which
+/// is the same mistake as the staging memcpy in a different costume. The
+/// pieces are disjoint and positional, so they need no shared file cursor.
+fn read_parallel(f: &std::fs::File, buf: &mut [u8], off: u64) -> Result<usize> {
+    use rayon::prelude::*;
+    const MIN_PARALLEL: usize = 1 << 20;
+    if buf.len() < MIN_PARALLEL {
+        return read_fully(f, buf, off).map_err(WarpError::from);
+    }
+    let threads = rayon::current_num_threads().clamp(1, 16);
+    let piece = buf.len().div_ceil(threads);
+    let counts: Vec<std::io::Result<usize>> = buf
+        .par_chunks_mut(piece)
+        .enumerate()
+        .map(|(i, part)| read_fully(f, part, off + (i * piece) as u64))
+        .collect();
+    let mut total = 0;
+    for c in counts {
+        // EOF is monotonic in offset, so once a piece comes up short every
+        // later piece read nothing and the sum is still the prefix length.
+        total += c?;
+    }
+    Ok(total)
+}
+
+fn read_fully(f: &std::fs::File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<usize> {
+    let mut total = 0;
+    while !buf.is_empty() {
+        match read_at(f, buf, off) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf = &mut buf[n..];
+                off += n as u64;
+                total += n;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
 }
 
 /// Parallel memcpy into the pinned staging buffer.
