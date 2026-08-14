@@ -669,3 +669,86 @@ fn unicode_survives_the_round_trip_through_argv_and_output() {
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     assert_eq!(out.lines(), vec!["{\"host\":\"日本\"}"]);
 }
+
+/// The GPU backend reads real files through its own pinned reader, not the
+/// chunker. The differential suite runs everything through `Input::from_bytes`,
+/// which is a stream, so none of it covers that path; only tests that go
+/// through a file on disk do. These are those tests.
+mod pinned_reader {
+    use super::*;
+
+    fn gpu_and_cpu_agree(args: &[&str], file: &str) {
+        let gpu = run(&[&["--backend", "gpu"], args, &[file]].concat());
+        let cpu = run(&[&["--backend", "cpu"], args, &[file]].concat());
+        if gpu.stderr.contains("no usable GPU") || gpu.stderr.contains("GPU is unavailable") {
+            eprintln!("cli: SKIPPING, no GPU");
+            return;
+        }
+        assert_eq!(gpu.code, cpu.code, "exit codes differ, gpu: {}", gpu.stderr);
+        assert_eq!(gpu.stdout, cpu.stdout, "output differs\ngpu stderr: {}", gpu.stderr);
+    }
+
+    #[test]
+    fn a_line_longer_than_the_chunk_is_handled_without_reading_the_rest() {
+        // The chunk buffer cannot hold this line, but the limit allows it, so
+        // the reader has to take the line on its own and resume on the device.
+        // Before this was fixed the whole remainder of the file went to the
+        // CPU as one chunk, which on a large input meant faulting all of it.
+        let s = Scratch::new("longline");
+        let big = "x".repeat(2 << 20);
+        let mut data = String::new();
+        data.push_str("{\"a\":1,\"tag\":\"before\"}\n");
+        data.push_str(&format!("{{\"a\":2,\"pad\":\"{big}\"}}\n"));
+        // Enough after the long line to need several more chunks, which only
+        // run if the reader resumed rather than handing off the remainder.
+        for i in 0..200_000 {
+            data.push_str(&format!("{{\"a\":{},\"tag\":\"after\"}}\n", i % 5));
+        }
+        let f = s.write("long.ndjson", &data);
+        gpu_and_cpu_agree(&["--chunk-size", "1MB", "--max-line-bytes", "8MB", "count"], &p(&f));
+        gpu_and_cpu_agree(&["--chunk-size", "1MB", "--max-line-bytes", "8MB", "select(.a == 2) | count"], &p(&f));
+        gpu_and_cpu_agree(&["--chunk-size", "1MB", "--max-line-bytes", "8MB", "group_by(.tag) | count"], &p(&f));
+    }
+
+    #[test]
+    fn a_line_past_the_limit_is_an_error_not_a_fallback() {
+        let s = Scratch::new("longline-err");
+        let big = "x".repeat(2 << 20);
+        let f = s.write("over.ndjson", &format!("{{\"a\":\"{big}\"}}\n"));
+        let out = run(&["--backend", "gpu", "--chunk-size", "1MB",
+                        "--max-line-bytes", "1MB", ".a", &p(&f)]);
+        if out.stderr.contains("no usable GPU") {
+            return;
+        }
+        assert_ne!(out.code, 0, "stdout: {}", out.stdout);
+        assert!(out.stderr.contains("limit"), "stderr: {}", out.stderr);
+    }
+
+    #[test]
+    fn many_chunks_from_a_file_agree_with_the_cpu() {
+        // Small chunks so a single modest file crosses many buffer boundaries,
+        // exercising the re-read of the tail past each newline.
+        let s = Scratch::new("multichunk");
+        let mut data = String::new();
+        for i in 0..120_000 {
+            data.push_str(&format!(
+                "{{\"status\":{},\"host\":\"h{}\",\"bytes\":{}}}\n",
+                if i % 7 == 0 { 500 } else { 200 }, i % 4, i * 3
+            ));
+        }
+        let f = s.write("multi.ndjson", &data);
+        for cs in ["64KB", "256KB", "1MB"] {
+            gpu_and_cpu_agree(&["--chunk-size", cs, "select(.status == 500) | count"], &p(&f));
+            gpu_and_cpu_agree(&["--chunk-size", cs, "group_by(.host) | sum(.bytes)"], &p(&f));
+            gpu_and_cpu_agree(&["--chunk-size", cs, "select(.status == 500)"], &p(&f));
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_trailing_newline_keeps_its_last_line() {
+        let s = Scratch::new("no-trailing-nl");
+        let f = s.write("t.ndjson", "{\"a\":1}\n{\"a\":2}\n{\"a\":3}");
+        gpu_and_cpu_agree(&["count"], &p(&f));
+        gpu_and_cpu_agree(&["select(.a == 3)"], &p(&f));
+    }
+}

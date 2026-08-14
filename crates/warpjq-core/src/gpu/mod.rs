@@ -245,7 +245,9 @@ impl Backend for GpuBackend {
         // and keeps the chunker.
         if let Some((file, len)) = input.file() {
             let mut rd = PinnedReader::new(file, len, options.max_line_bytes);
-            let mut oversized: Option<u64> = None;
+            // Reused across chunks so a file with many long lines does not
+            // reallocate for each one.
+            let mut long_line: Vec<u8> = Vec::new();
             while !rd.done() && abort.is_none() {
                 let slot = (chunk_no % N_SLOTS as u64) as u32;
                 let buf = unsafe { ffi::warpjq_slot_buffer(ctx, slot) };
@@ -263,11 +265,49 @@ impl Backend for GpuBackend {
                 };
                 prof.read += t.elapsed();
                 let Some(n_bytes) = got else {
-                    // One line longer than the whole buffer. Rare enough to be
-                    // worth handling by rereading that stretch through the
-                    // mapping rather than complicating the fast path.
-                    oversized = Some(rd.off);
-                    break;
+                    // One line longer than the whole buffer. Take just that
+                    // line on the CPU and carry on with the device for the
+                    // rest of the file.
+                    //
+                    // Draining first is not optional: the CPU path writes
+                    // straight to the shared writer, so running it while a
+                    // chunk is still on the device would put this line's rows
+                    // ahead of that chunk's. Output order is input order.
+                    if let Some(prev) = in_flight.take() {
+                        if let Err(e) = drain(
+                            &prev,
+                            writer,
+                            &mut totals,
+                            &mut stats,
+                            &mut prof,
+                            &mut lines_seen,
+                        ) {
+                            abort = Some(e);
+                            break;
+                        }
+                    }
+                    if let Err(e) = rd.take_long_line(&mut long_line) {
+                        abort = Some(e);
+                        break;
+                    }
+                    stats.bytes_in += long_line.len() as u64;
+                    let chunk = Chunk {
+                        data: &long_line,
+                        first_line: lines_seen + 1,
+                    };
+                    match run_chunk_on_cpu(
+                        &chunk,
+                        &plan,
+                        options,
+                        writer,
+                        &mut totals,
+                        &mut stats,
+                        &file_name,
+                    ) {
+                        Ok(n) => lines_seen += n,
+                        Err(e) => abort = Some(e),
+                    }
+                    continue;
                 };
                 if n_bytes == 0 {
                     break;
@@ -312,14 +352,6 @@ impl Backend for GpuBackend {
                 }
             }
 
-            if let (Some(from), None) = (oversized, abort.as_ref()) {
-                if let Err(e) = run_tail_on_cpu(
-                    input, from, &plan, options, writer, &mut totals, &mut stats,
-                    &mut lines_seen,
-                ) {
-                    abort = Some(e);
-                }
-            }
 
             prof.report();
             if let Some(e) = abort {
@@ -491,39 +523,6 @@ fn submit(ctx: *mut ffi::Ctx, slot: u32, n_bytes: usize, prof: &mut Profile) -> 
     Ok(())
 }
 
-/// Finishes a file on the CPU from `from` onward.
-///
-/// Only reachable when a single line is longer than the whole buffer, which
-/// the pinned reader cannot split. Reading it through the mapping keeps that
-/// case out of the path every other chunk takes.
-#[allow(clippy::too_many_arguments)]
-fn run_tail_on_cpu<W: Write>(
-    input: &Input,
-    from: u64,
-    plan: &crate::exec::cpu::Plan,
-    options: &Options,
-    writer: &mut Writer<W>,
-    totals: &mut Totals,
-    stats: &mut RunStats,
-    lines_seen: &mut u64,
-) -> Result<()> {
-    let Some(map) = input.mapping() else {
-        return Err(WarpError::other(
-            "a line is longer than the chunk buffer and the input cannot be re-read",
-        ));
-    };
-    let data = &map[from as usize..];
-    stats.bytes_in += data.len() as u64;
-    let chunk = Chunk {
-        data,
-        first_line: *lines_seen + 1,
-    };
-    let name = input.name().to_string();
-    let n = run_chunk_on_cpu(&chunk, plan, options, writer, totals, stats, &name)?;
-    *lines_seen += n;
-    Ok(())
-}
-
 /// Reads the file directly into the pinned buffers the DMA engine reads from.
 ///
 /// The bytes land once, in the only buffer that holds them. There is no
@@ -614,6 +613,55 @@ impl<'a> PinnedReader<'a> {
 
         self.off += end as u64;
         Ok(Some(end))
+    }
+}
+
+impl PinnedReader<'_> {
+    /// Reads the one line that would not fit in a chunk buffer into `out`.
+    ///
+    /// Bounded by `--max-line-bytes`, never by the file. The obvious shortcut
+    /// here is to hand the rest of the mapping to the CPU backend and be done,
+    /// but "the rest" is the whole remaining file: on a 128 GB input, one long
+    /// line near the front would fault in all of it. This reads exactly the
+    /// offending line, and the caller resumes on the GPU immediately after it.
+    ///
+    /// With the defaults the limit and the buffer are both 64 MB, so a line
+    /// that does not fit does not pass the limit either and this returns the
+    /// same error the chunker would. It does real work only when the limit has
+    /// been raised above the chunk size.
+    fn take_long_line(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        const STEP: usize = 1 << 20;
+        out.clear();
+        let mut scratch = vec![0u8; STEP];
+        loop {
+            let remaining = self.len - self.off;
+            if remaining == 0 {
+                break;
+            }
+            let want = STEP.min(remaining as usize);
+            let n = read_fully(self.file, &mut scratch[..want], self.off)?;
+            if n == 0 {
+                break;
+            }
+            let (piece, complete) = match scratch[..n].iter().position(|&b| b == b'\n') {
+                Some(p) => (&scratch[..p + 1], true),
+                None => (&scratch[..n], false),
+            };
+            if out.len() + piece.len() > self.max_line {
+                return Err(WarpError::LineTooLong {
+                    line: self.lines_before + 1,
+                    len: out.len() + piece.len(),
+                    limit: self.max_line,
+                });
+            }
+            out.extend_from_slice(piece);
+            self.off += piece.len() as u64;
+            if complete {
+                break;
+            }
+        }
+        self.lines_before += 1;
+        Ok(())
     }
 }
 
