@@ -677,10 +677,18 @@ fn unicode_survives_the_round_trip_through_argv_and_output() {
 mod pinned_reader {
     use super::*;
 
+    /// `--backend gpu` refuses with this when there is no device, or when the
+    /// binary has no CUDA at all, which is every CI runner but the GPU job.
+    /// Matched on the phrase run.rs actually prints; guessing at the wording
+    /// made these tests fail on all three CPU platforms rather than skip.
+    fn no_gpu(stderr: &str) -> bool {
+        stderr.contains("the GPU is not usable")
+    }
+
     fn gpu_and_cpu_agree(args: &[&str], file: &str) {
         let gpu = run(&[&["--backend", "gpu"], args, &[file]].concat());
         let cpu = run(&[&["--backend", "cpu"], args, &[file]].concat());
-        if gpu.stderr.contains("no usable GPU") || gpu.stderr.contains("GPU is unavailable") {
+        if no_gpu(&gpu.stderr) {
             eprintln!("cli: SKIPPING, no GPU");
             return;
         }
@@ -717,7 +725,8 @@ mod pinned_reader {
         let f = s.write("over.ndjson", &format!("{{\"a\":\"{big}\"}}\n"));
         let out = run(&["--backend", "gpu", "--chunk-size", "1MB",
                         "--max-line-bytes", "1MB", ".a", &p(&f)]);
-        if out.stderr.contains("no usable GPU") {
+        if no_gpu(&out.stderr) {
+            eprintln!("cli: SKIPPING, no GPU");
             return;
         }
         assert_ne!(out.code, 0, "stdout: {}", out.stdout);
