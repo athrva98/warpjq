@@ -7,10 +7,11 @@ per figure.
 ## Pipeline
 
 ```
-file (mmap or stream)
-  -> chunker            newline-aligned, never splits a line
-  -> parallel memcpy    into pinned host buffer, slot N
-  -> cudaMemcpyAsync    H2D; slot N uploads and computes while N-1 drains
+file
+  -> reader thread      positional reads straight into pinned slot N,
+                        newline-aligned, trimmed to the device line budget
+  -> cudaMemcpyAsync    H2D from that buffer; no staging copy exists
+                        slot N computes while N-1 drains and N+1 is read
   -> k_nl_count/write   newline scan
   -> k_build_lines      (offset, length) pairs, blank detection
   -> k_eval             validate, resolve paths, predicate, group table
