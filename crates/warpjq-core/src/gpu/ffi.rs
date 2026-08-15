@@ -164,6 +164,7 @@ extern "C" {
 
     pub fn warpjq_slot_buffer(ctx: *mut Ctx, slot: u32) -> *mut u8;
     pub fn warpjq_slot_capacity(ctx: *const Ctx) -> u64;
+    pub fn warpjq_max_lines(ctx: *const Ctx) -> u64;
 
     pub fn warpjq_submit(
         ctx: *mut Ctx,

@@ -297,6 +297,7 @@ impl Backend for GpuBackend {
                 return Err(WarpError::other("device staging buffer is unavailable"));
             }
             let max_line = options.max_line_bytes;
+            let max_lines = unsafe { ffi::warpjq_max_lines(ctx) };
             // Reading ahead needs a slot that is neither in flight nor being
             // drained, so it is available only when a third was allocated.
             let prefetch = n_slots >= PREFETCH_SLOTS;
@@ -306,7 +307,7 @@ impl Backend for GpuBackend {
                 let (res_tx, res_rx) = std::sync::mpsc::channel::<(ReadOut, bool)>();
 
                 scope.spawn(move || {
-                    let mut rd = PinnedReader::new(file, len, max_line);
+                    let mut rd = PinnedReader::new(file, len, max_line, max_lines);
                     while let Ok(slot) = req_rx.recv() {
                         let dst = bufs[slot as usize] as *mut u8;
                         let out = match rd.next_chunk(dst, cap) {
@@ -663,11 +664,14 @@ struct PinnedReader<'a> {
     len: u64,
     off: u64,
     max_line: usize,
+    /// Most lines the device can index in one chunk, from the context rather
+    /// than recomputed here, so the limit has one definition.
+    max_lines: u64,
     lines_before: u64,
 }
 
 impl<'a> PinnedReader<'a> {
-    fn new(file: &'a std::fs::File, len: u64, max_line: usize) -> Self {
+    fn new(file: &'a std::fs::File, len: u64, max_line: usize, max_lines: u64) -> Self {
         PinnedReader {
             file,
             len,
@@ -676,6 +680,7 @@ impl<'a> PinnedReader<'a> {
             // reading past it.
             off: bom_len(file, len),
             max_line,
+            max_lines,
             lines_before: 0,
         }
     }
@@ -698,6 +703,20 @@ impl<'a> PinnedReader<'a> {
         if n == 0 {
             self.off = self.len;
             return Ok(Some(0));
+        }
+
+        // A chunk holding more lines than the index buffers were sized for
+        // cannot be represented on the device, and the whole thing would be
+        // redone on the CPU. The buffers assume 24 bytes a line; `{"a":1}` is
+        // seven, so ordinary small records lost the GPU entirely.
+        //
+        // Nothing about the buffers has to change to fix that. The limit is on
+        // lines per chunk, not bytes, so submitting fewer bytes brings a dense
+        // chunk back under it. The work is the same; it arrives in more, and
+        // smaller, pieces.
+        if let Some(cut) = self.trim_to_line_budget(&buf[..n]) {
+            self.off += cut as u64;
+            return Ok(Some(cut));
         }
 
         let at_eof = self.off + n as u64 >= self.len;
@@ -747,6 +766,49 @@ impl<'a> PinnedReader<'a> {
 }
 
 impl PinnedReader<'_> {
+    /// Byte length holding at most `max_lines` lines, or `None` to send it all.
+    ///
+    /// Counting every newline in every chunk is what the pipeline deliberately
+    /// stopped doing: it is a full pass over the input and it cost more than
+    /// the kernels. So this samples the head of the chunk first, and only data
+    /// dense enough to be near the limit pays for the exact scan. Ordinary
+    /// logs run about a hundred bytes a line and never reach it.
+    ///
+    /// The sample can only mislead in one direction that matters. If it
+    /// underestimates and the chunk turns out to hold too many lines, the
+    /// device reports the overflow and the host redoes that chunk on the CPU,
+    /// which is the behaviour this replaces rather than a new failure.
+    fn trim_to_line_budget(&self, buf: &[u8]) -> Option<usize> {
+        const SAMPLE: usize = 1 << 16;
+        let budget = self.max_lines as usize;
+        if budget == 0 {
+            return None;
+        }
+        let sample = SAMPLE.min(buf.len());
+        let seen = bytecount_newlines(&buf[..sample]);
+        // Extrapolate, then leave headroom, since line density varies within a
+        // file and being wrong here costs a whole chunk.
+        let projected = (seen as u128 * buf.len() as u128 / sample.max(1) as u128) as usize;
+        if projected * 2 < budget {
+            return None;
+        }
+
+        // Dense enough to be worth the exact walk. Stop at the budget rather
+        // than counting the whole buffer.
+        let mut lines = 0usize;
+        for (i, &b) in buf.iter().enumerate() {
+            if b == b'\n' {
+                lines += 1;
+                if lines == budget {
+                    // One byte past the newline, so the chunk still ends on a
+                    // line boundary.
+                    return (i + 1 < buf.len()).then_some(i + 1);
+                }
+            }
+        }
+        None
+    }
+
     /// Reads the one line that would not fit in a chunk buffer into `out`.
     ///
     /// Bounded by `--max-line-bytes`, never by the file. The obvious shortcut
@@ -793,6 +855,12 @@ impl PinnedReader<'_> {
         self.lines_before += 1;
         Ok(())
     }
+}
+
+/// Newlines in `buf`. Split out so the scan has one implementation and the
+/// tests can reach it.
+fn bytecount_newlines(buf: &[u8]) -> usize {
+    buf.iter().filter(|&&b| b == b'\n').count()
 }
 
 /// Length of a leading UTF-8 byte-order mark, which Windows tooling prepends

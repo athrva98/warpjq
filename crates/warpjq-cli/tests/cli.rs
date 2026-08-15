@@ -830,14 +830,53 @@ mod pinned_reader {
         }
     }
 
-    /// A run where the device did none of the work has to say so. The index
-    /// buffers are sized at chunk/24 bytes a line, so short lines overflow
-    /// them and the whole chunk is redone on the CPU. The answer stays right,
-    /// which is why this needs reporting to be visible at all: without it the
-    /// run is indistinguishable from a fast GPU one.
+    /// A run where the device did none of the work has to say so.
+    ///
+    /// The group table is a fixed 65536 slots, so a key cardinality past it
+    /// cannot be represented and the chunk is redone on the CPU. The answer
+    /// stays right, which is exactly why this needs reporting: correct output
+    /// is not evidence the device did anything.
     #[test]
     fn stats_report_chunks_that_ran_entirely_on_the_cpu() {
         let s = Scratch::new("fallback-stats");
+        let mut data = String::new();
+        for i in 0..200_000 {
+            data.push_str(&format!(
+                "{{\"h\":\"host-{i}\",\"n\":{}}}
+",
+                i % 5
+            ));
+        }
+        let f = s.write("wide.ndjson", &data);
+        let out = run(&[
+            "--backend",
+            "gpu",
+            "--stats",
+            "group_by(.h) | count",
+            &p(&f),
+        ]);
+        if no_gpu(&out.stderr) {
+            eprintln!("cli: SKIPPING, no GPU");
+            return;
+        }
+        assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+        assert!(
+            out.stderr.contains("ran entirely on the CPU"),
+            "a run the device sat out should say so, stderr: {}",
+            out.stderr
+        );
+        let cpu = run(&["--backend", "cpu", "group_by(.h) | count", &p(&f)]);
+        assert_eq!(out.stdout, cpu.stdout);
+    }
+
+    /// Short lines used to lose the GPU entirely: the index buffers assume
+    /// 24 bytes a line, so a file of small records overflowed every chunk and
+    /// all of it was redone on the CPU. The reader now submits fewer bytes so
+    /// each chunk stays under the line budget, which keeps the work on the
+    /// device without changing any buffer size.
+    #[test]
+    fn short_lines_stay_on_the_device() {
+        let s = Scratch::new("short-lines-gpu");
         let mut data = String::new();
         for i in 0..400_000 {
             data.push_str(&format!(
@@ -862,14 +901,38 @@ mod pinned_reader {
         }
         assert_eq!(out.code, 0, "stderr: {}", out.stderr);
         assert!(
-            out.stderr.contains("ran entirely on the CPU"),
-            "a run the device sat out should say so, stderr: {}",
+            !out.stderr.contains("ran entirely on the CPU"),
+            "8-byte lines should still run on the device, stderr: {}",
             out.stderr
         );
-        // And the answer is still right, which is the trap: correct output is
-        // not evidence the GPU did anything.
         let cpu = run(&["--backend", "cpu", "select(.a == 3) | count", &p(&f)]);
         assert_eq!(out.stdout, cpu.stdout);
+    }
+
+    /// The trim has to hold for every shape, since projection and passthrough
+    /// size their output buffers off the line count too.
+    #[test]
+    fn short_lines_agree_with_the_cpu_across_shapes() {
+        let s = Scratch::new("short-lines-shapes");
+        let mut data = String::new();
+        for i in 0..300_000 {
+            data.push_str(&format!(
+                "{{\"a\":{},\"b\":{}}}
+",
+                i % 7,
+                i % 3
+            ));
+        }
+        let f = s.write("short2.ndjson", &data);
+        for cs in ["1MB", "4MB"] {
+            gpu_and_cpu_agree(&["--chunk-size", cs, "count"], &p(&f));
+            gpu_and_cpu_agree(&["--chunk-size", cs, "group_by(.a) | count"], &p(&f));
+            gpu_and_cpu_agree(&["--chunk-size", cs, "select(.a == 3)"], &p(&f));
+            gpu_and_cpu_agree(
+                &["--chunk-size", cs, "select(.a == 3) | {x: .a, y: .b}"],
+                &p(&f),
+            );
+        }
     }
 
     #[test]

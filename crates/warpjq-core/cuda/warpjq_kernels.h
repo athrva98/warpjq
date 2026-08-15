@@ -250,6 +250,15 @@ void warpjq_ctx_destroy(warpjq_ctx *ctx);
 uint8_t *warpjq_slot_buffer(warpjq_ctx *ctx, uint32_t slot);
 uint64_t warpjq_slot_capacity(const warpjq_ctx *ctx);
 
+/* Most lines a single submitted chunk may contain.
+ *
+ * The index buffers are sized from this, so a chunk holding more cannot be
+ * represented and has to be redone on the CPU. The caller is expected to keep
+ * chunks under it by submitting fewer bytes, which is why it is exposed rather
+ * than left as an internal detail: recomputing it host-side from the same
+ * constant would put one limit in two places, and they would drift. */
+uint64_t warpjq_max_lines(const warpjq_ctx *ctx);
+
 /* Queues H2D + kernels for `slot`. Returns immediately; the caller is free to
  * fill another slot while this one runs. That overlap is the entire point of
  * the design: PCIe transfer, not the kernels, is the budget. */

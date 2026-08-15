@@ -2393,6 +2393,10 @@ uint8_t *warpjq_slot_buffer(warpjq_ctx *ctx, uint32_t slot) {
   return ctx->slots[slot].h_pinned;
 }
 
+uint64_t warpjq_max_lines(const warpjq_ctx *ctx) {
+  return ctx ? (uint64_t)ctx->max_lines : 0;
+}
+
 uint64_t warpjq_slot_capacity(const warpjq_ctx *ctx) {
   return ctx ? ctx->chunk_cap : 0;
 }

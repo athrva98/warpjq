@@ -176,11 +176,24 @@ shortest legal NDJSON line is `{}`, so a pathological file holds 3x more. The
 device reports `chunk_overflow` and the host redoes that chunk on the CPU.
 
 Nothing pathological is required to hit it. `{"a":1}` is seven bytes, so a
-file of small records overflows every chunk and runs entirely on the CPU while
-`--stats` still names the backend `gpu`. That is why the redone chunks are
-counted and reported separately: correct output is not evidence the device did
-any work, and this case is invisible otherwise. The same 24-byte assumption is
-what let `k_nl_write` run off its buffer before it was given a bound.
+file of small records used to overflow every chunk and run entirely on the CPU
+while `--stats` still named the backend `gpu`.
+
+The reader now keeps chunks under the limit by submitting fewer bytes, since
+the limit is on lines rather than bytes and no buffer has to change size for a
+dense chunk to fit. Counting every newline is the pass this pipeline
+deliberately removed, so it samples 64 KB of the chunk first and only data
+dense enough to approach the limit pays for the exact scan. On 92 MB of
+8-byte records that took a filter-and-count from 0.735 s, entirely on the CPU,
+to 0.266 s on the device.
+
+A sample that underestimates falls back to the old behaviour rather than
+failing: the device reports the overflow and the host redoes that chunk. Those
+chunks are counted and reported separately from declined lines, because
+correct output is not evidence the device did any work, and the case is
+invisible otherwise. Group cardinality past the 65536-slot table still
+triggers it. The same 24-byte assumption is what let `k_nl_write` run off its
+buffer before it was given a bound.
 
 Per-line slot tables are not materialised. `k_eval` resolves paths into
 registers and the emit kernel re-resolves for surviving lines only, which costs
